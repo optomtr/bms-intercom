@@ -37,10 +37,21 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
 
 
 async def _async_start_proxy(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Start the built-in local HTTPS endpoint once (for the microphone)."""
+    """Start the built-in local HTTPS endpoint once (for the microphone).
+
+    Set the port option to 0 (or below) to disable the built-in endpoint — e.g.
+    when you run your own reverse proxy (Caddy/NGINX) on the same port and would
+    otherwise clash on 8443. See docs/local-https.md.
+    """
     if hass.data.get(_PROXY_KEY) is not None:
         return
     port = entry.options.get(CONF_PROXY_PORT, DEFAULT_PROXY_PORT)
+    if port <= 0:
+        _LOGGER.info(
+            "BMS Intercom: встроенный HTTPS отключён (порт 0) — используйте "
+            "внешний обратный прокси и опцию «Внешний HTTPS-адрес»"
+        )
+        return
     proxy = HTTPSProxy(hass, port)
     hass.data[_PROXY_KEY] = proxy
     await proxy.async_start()
