@@ -36,7 +36,11 @@ class BMSIntercomEntity(Entity):
             attrs["intercom_role"] = self._intercom_role
         if self.device.https_url:
             attrs["intercom_https_base"] = self.device.https_url
-        attrs["intercom_https_port"] = str(self.device.proxy_port)
+        # Only advertise the built-in port when it is actually running. When it
+        # is disabled (port 0, e.g. an external proxy owns 8443) the card must
+        # fall back to the external/HA HTTPS address, not build a :0 link.
+        if self.device.proxy_port > 0:
+            attrs["intercom_https_port"] = str(self.device.proxy_port)
         return attrs
 
     @property
