@@ -26,8 +26,12 @@
           "http_port": "HTTP port (ISAPI)",
           "rtsp_port": "RTSP port",
           "door_no": "Door relay number",
-          "channel": "Video channel (101 = main stream, 102 = sub stream)",
-          "use_alert_stream": "Use the event stream (alertStream)"
+          "channel": "Video channel",
+          "use_alert_stream": "Use the event stream"
+        },
+        "data_description": {
+          "channel": "101 = main stream, 102 = sub stream, 1 = legacy panels",
+          "use_alert_stream": "alertStream: the panel pushes call events. Turn off for models without it — the call status is then polled."
         }
       }
     },
@@ -45,16 +49,38 @@
         "title": "BMS Intercom settings",
         "description": "The browser microphone only works over HTTPS; the integration starts a local HTTPS endpoint automatically. You can also change the panel video channel, turn the event stream off and set the call reset timeout here.",
         "data": {
-          "proxy_port": "Built-in HTTPS port (default 8443)",
+          "proxy_port": "Built-in HTTPS port",
           "https_url": "External HTTPS address (optional)",
           "call_timeout": "Reset the call after, seconds",
-          "channel": "Video channel (101 = main stream, 102 = sub stream)",
-          "use_alert_stream": "Use the event stream (alertStream)"
+          "channel": "Video channel",
+          "use_alert_stream": "Use the event stream"
+        },
+        "data_description": {
+          "channel": "101 = main stream, 102 = sub stream, 1 = legacy panels",
+          "use_alert_stream": "alertStream: the panel pushes call events. Turn off for models without it — the call status is then polled.",
+          "call_timeout": "If the panel never reports the end of a call, the state returns to idle after this long.",
+          "proxy_port": "8443 by default. Needed for the browser microphone (secure context)."
         }
       }
     },
     "error": {
       "https_required": "The address must start with https://"
+    }
+  },
+  "services": {
+    "probe": {
+      "name": "Probe the panel",
+      "description": "Probes the known ISAPI endpoints and writes a report to the log and to the «Проверить панель» button attributes. The password never appears in it.",
+      "fields": {
+        "entry_id": {
+          "name": "Intercom",
+          "description": "Config entry id. Empty = probe them all."
+        },
+        "test_door": {
+          "name": "Test the door relay",
+          "description": "WARNING: really opens the door. Off by default."
+        }
+      }
     }
   }
 }

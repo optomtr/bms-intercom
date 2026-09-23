@@ -31,6 +31,8 @@ class ProbeResult:
     #: What we put in `Authorization` (digest verbatim, basic reduced to the
     #: scheme: its base64 payload *is* the password).
     sent_auth: str = ""
+    #: Every auth attempt for this endpoint: (scheme, header, status).
+    attempts: tuple[tuple[str, str, int], ...] = ()
     error: str = ""
     secrets: tuple[str | None, ...] = field(default=(), repr=False)
 
@@ -54,7 +56,9 @@ class ProbeResult:
         line = "  ".join(parts)
         if self.challenge:
             line += f"\n        challenge: {self.challenge}"
-        if self.sent_auth:
+        for scheme, header, status in self.attempts:
+            line += f"\n        {scheme} → {status}  {header or '(без Authorization)'}"
+        if not self.attempts and self.sent_auth:
             line += f"\n        отправили: {self.sent_auth}"
         return line
 
@@ -70,6 +74,10 @@ class ProbeResult:
             "body": snippet(self.body, secrets=self.secrets),
             "challenge": self.challenge,
             "sent_auth": self.sent_auth,
+            "attempts": [
+                {"scheme": s, "authorization": h, "status": st}
+                for s, h, st in self.attempts
+            ],
             "error": redact(self.error, *self.secrets),
         }
 

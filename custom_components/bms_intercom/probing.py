@@ -11,7 +11,12 @@ from typing import Any
 
 import httpx
 
-from .digest import safe_auth_header
+from .digest import (
+    basic_authorization,
+    build_authorization,
+    pick_digest_challenge,
+    safe_auth_header,
+)
 from .endpoints import (
     alert_stream_paths,
     call_status_calls,
@@ -31,8 +36,63 @@ from .probe import ProbeResult
 _LOGGER = logging.getLogger(__name__)
 
 
+#: The endpoint a browser was proven to authenticate against on DS-K1T341AM.
+AUTH_CHECK_PATH = "/ISAPI/Security/userCheck"
+
+
 class ProbeMixin:
     """Diagnostics half of ISAPIClient."""
+
+    async def async_auth_matrix(self, path: str = AUTH_CHECK_PATH) -> dict[str, Any]:
+        """Try digest and basic explicitly, side by side, on one endpoint.
+
+        Neither attempt touches the client's remembered scheme, and neither
+        can hide the other: the report gets `digest → <status>` and
+        `basic → <status>` for the very endpoint the browser succeeded on.
+        """
+        url = f"{self._base}{path}"
+        out: dict[str, Any] = {
+            "путь": path,
+            "digest": "не пробовали",
+            "basic": "не пробовали",
+            "digest_header": "",
+            "challenge": "",
+        }
+
+        try:
+            bare = await self._raw("GET", url, None, {})
+        except Exception as err:  # noqa: BLE001 - diagnostics never raise
+            out["digest"] = f"ошибка: {err}"
+            return out
+
+        if bare.status_code != 401:
+            out["digest"] = f"{bare.status_code} (401 не пришёл)"
+        else:
+            challenges = list(bare.headers.get_list("www-authenticate"))
+            out["challenge"] = "; ".join(challenges) or "(заголовок не прислан)"
+            challenge = pick_digest_challenge(challenges)
+            if challenge is None:
+                out["digest"] = "панель не предлагает digest"
+            else:
+                header = build_authorization(
+                    self._username, self._password, "GET", path, challenge, nc=1
+                )
+                out["digest_header"] = header
+                try:
+                    signed = await self._raw("GET", url, None, {"Authorization": header})
+                    out["digest"] = signed.status_code
+                except Exception as err:  # noqa: BLE001
+                    out["digest"] = f"ошибка: {err}"
+
+        try:
+            basic = await self._raw(
+                "GET", url, None,
+                {"Authorization": basic_authorization(self._username, self._password)},
+            )
+            out["basic"] = basic.status_code
+        except Exception as err:  # noqa: BLE001
+            out["basic"] = f"ошибка: {err}"
+        return out
 
     async def _probe_one(
         self, name: str, method: str, path: str, *, body: str | None = None,
@@ -49,6 +109,7 @@ class ProbeMixin:
         result.status = resp.status_code
         result.auth = self.auth_mode
         result.sent_auth = self.last_auth_header
+        result.attempts = tuple(self.last_attempts)
         if resp.status_code == 401:
             result.challenge = self.last_challenge_raw
         result.content_type = resp.headers.get("content-type", "")
@@ -102,6 +163,7 @@ class ProbeMixin:
                 if status_ok(results[-1].status):
                     break
 
+        matrix = await self.async_auth_matrix()
         working = [r for r in results if r.ok]
         summary: dict[str, Any] = {
             "модель": self._device_model(results),
@@ -109,8 +171,11 @@ class ProbeMixin:
             "разбор вызова": (
                 self._challenge.describe() if self._challenge else "(digest не предложен)"
             ),
-            "Authorization (последний отправленный)": (
-                self.last_auth_header or "(не отправляли)"
+            f"проверка {matrix['путь']}": (
+                f"digest → {matrix['digest']}, basic → {matrix['basic']}"
+            ),
+            "Authorization (digest, эта проверка)": (
+                matrix["digest_header"] or "(digest не отправляли)"
             ),
             "авторизация": (
                 f"{self.auth_mode} (успешно)" if working else f"{self.auth_mode} (ни один запрос не прошёл)"

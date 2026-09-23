@@ -168,7 +168,65 @@ class TestChallengeParsing(unittest.TestCase):
         self.assertIn("qop=auth, auth-int", text)
         self.assertIn("algorithm=MD5", text)
         self.assertIn("nonce=44 симв.", text)
-        self.assertIn("opaque=да", text)
+        self.assertIn("opaque=44 симв.", text)
+
+
+# The real challenge of the owner's DS-K1T341AM, firmware V3.2.30: no
+# algorithm, and `opaque` present but EMPTY.
+REAL_CHALLENGE = (
+    'Digest qop="auth", realm="DS-11A8BC2D", '
+    'nonce="NjNhNzdjNTVkNmM1ZTM0OGY3M2U2Zjg1ODM3NTNhNmY=", '
+    'stale="false", opaque="", domain="::"'
+)
+
+
+class TestEmptyOpaque(unittest.TestCase):
+    """An empty `opaque` is present, not absent — it must be echoed back."""
+
+    def setUp(self):
+        self.challenge = digest.parse_challenge(REAL_CHALLENGE)
+
+    def test_empty_opaque_counts_as_present(self):
+        self.assertTrue(self.challenge.has_opaque)
+        self.assertEqual(self.challenge.opaque, "")
+
+    def test_empty_opaque_is_echoed_verbatim(self):
+        header = digest.build_authorization(
+            "admin", "Sekret123!", "GET", "/ISAPI/Security/userCheck",
+            self.challenge, nc=1, cnonce="1234567890abcdef",
+        )
+        self.assertIn('opaque=""', header)
+
+    def test_absent_opaque_is_not_invented(self):
+        challenge = digest.parse_challenge('Digest realm="r", nonce="n", qop="auth"')
+        self.assertFalse(challenge.has_opaque)
+        header = digest.build_authorization("admin", "pw", "GET", "/x", challenge)
+        self.assertNotIn("opaque", header)
+
+    def test_response_matches_an_independent_computation(self):
+        header = digest.build_authorization(
+            "admin", "Sekret123!", "GET", "/ISAPI/Security/userCheck",
+            self.challenge, nc=1, cnonce="1234567890abcdef",
+        )
+        nonce = "NjNhNzdjNTVkNmM1ZTM0OGY3M2U2Zjg1ODM3NTNhNmY="
+        ha1 = hashlib.md5(b"admin:DS-11A8BC2D:Sekret123!").hexdigest()
+        ha2 = hashlib.md5(b"GET:/ISAPI/Security/userCheck").hexdigest()
+        expected = hashlib.md5(
+            f"{ha1}:{nonce}:00000001:1234567890abcdef:auth:{ha2}".encode()
+        ).hexdigest()
+        self.assertIn(f'response="{expected}"', header)
+        # opaque and domain take no part in the hash, only in the header.
+        self.assertIn('opaque=""', header)
+        self.assertNotIn("domain", header)
+
+    def test_no_algorithm_in_challenge_means_none_in_the_answer(self):
+        header = digest.build_authorization("admin", "pw", "GET", "/x", self.challenge)
+        self.assertNotIn("algorithm", header)
+
+    def test_describe_says_the_opaque_is_empty(self):
+        self.assertIn("opaque=пустой", self.challenge.describe())
+        self.assertIn("algorithm=(не указан)", self.challenge.describe())
+        self.assertIn("stale=false", self.challenge.describe())
 
 
 class TestSafeAuthHeader(unittest.TestCase):

@@ -140,8 +140,9 @@ class TestRealDigest(unittest.TestCase):
         client = make_client(panel)
         with self.assertRaises(isapi.ISAPIAuthError):
             run(client.async_verify())
-        # one bare + one signed attempt per candidate endpoint, no retry storm
-        self.assertLessEqual(len(panel.seen), 2 * 4)
+        # one bare + one signed attempt per candidate endpoint, plus exactly
+        # one basic rescue for the whole client — no retry storm
+        self.assertLessEqual(len(panel.seen), 2 * len(load("endpoints").identity_calls()) + 1)
         run(client.async_close())
 
     def test_probe_report_shows_the_challenge_and_what_we_sent(self):
@@ -157,6 +158,118 @@ class TestRealDigest(unittest.TestCase):
         self.assertIn("response=", report)
         self.assertNotIn("another-one", report)               # never the password
         self.assertIn("WWW-Authenticate (первый 401)", report)
+        run(client.async_close())
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class TestDualAttemptDiagnostics(unittest.TestCase):
+    """The basic fallback must never hide what digest sent and got back."""
+
+    def _panel(self, accept_basic: bool):
+        panel = FakeDigestPanel(password="совсем-другой")  # digest always 401s
+
+        def handler(request):
+            auth = request.headers.get("authorization", "")
+            if accept_basic and auth.lower().startswith("basic "):
+                panel.seen.append(auth)
+                return httpx.Response(200, text="<userCheck/>")
+            return panel(request)
+
+        return panel, handler
+
+    def test_both_attempts_are_reported_with_their_status(self):
+        _panel, handler = self._panel(accept_basic=True)
+        client = make_client(handler)
+        results, summary = run(client.async_probe())
+        report = load("probe").format_probe_report(results, summary=summary)
+        # Both attempts must show up for the SAME endpoint — the basic
+        # fallback must not replace the digest line of the one it rescued.
+        rescued = [r for r in results if any(
+            scheme == "basic" for scheme, _h, _s in r.attempts
+        )]
+        self.assertTrue(rescued, "разовая проверка basic не выполнялась")
+        line = rescued[0].as_line()
+        self.assertIn("digest → 401", line)
+        self.assertIn("basic → 200", line)
+        self.assertIn("digest → 401", report)          # per-endpoint attempt
+        self.assertIn("basic → 200", report)           # its one-shot rescue
+        # The digest header is still visible even though basic came last.
+        self.assertIn('username="admin"', report)
+        self.assertIn("Basic ***", report)
+        # And the side-by-side line for the browser-proven endpoint.
+        self.assertIn("проверка /ISAPI/Security/userCheck", report)
+        self.assertNotIn("совсем-другой", report)
+        run(client.async_close())
+
+    def test_attempts_are_recorded_per_request(self):
+        _panel, handler = self._panel(accept_basic=True)
+        client = make_client(handler)
+        run(client.async_verify())
+        schemes = [scheme for scheme, _h, _s in client.last_attempts]
+        self.assertEqual(schemes, ["без заголовка", "digest", "basic"])
+        self.assertEqual([st for _s, _h, st in client.last_attempts], [401, 401, 200])
+        run(client.async_close())
+
+    def test_basic_rescue_happens_only_once(self):
+        """A panel that rejects everything must not double every request."""
+        _panel, handler = self._panel(accept_basic=False)
+        client = make_client(handler)
+        with self.assertRaises(isapi.ISAPIAuthError):
+            run(client.async_verify())
+        basics = sum(
+            1 for scheme, _h, _s in client.last_attempts if scheme == "basic"
+        )
+        self.assertLessEqual(basics, 1)
+        self.assertTrue(client._basic_rescue_tried)
+        run(client.async_close())
+
+    def test_auth_matrix_tries_both_on_usercheck(self):
+        _panel, handler = self._panel(accept_basic=False)
+        client = make_client(handler)
+        matrix = run(client.async_auth_matrix())
+        self.assertEqual(matrix["путь"], "/ISAPI/Security/userCheck")
+        self.assertEqual(matrix["digest"], 401)
+        self.assertEqual(matrix["basic"], 401)
+        self.assertIn('username="admin"', matrix["digest_header"])
+        self.assertIn("Digest realm=", matrix["challenge"])
+        run(client.async_close())
+
+    def test_auth_matrix_reports_digest_success(self):
+        panel = FakeDigestPanel()          # correct password
+        client = make_client(panel)
+        matrix = run(client.async_auth_matrix())
+        self.assertEqual(matrix["digest"], 200)
+        run(client.async_close())
+
+    def test_matrix_line_is_in_the_report(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        results, summary = run(client.async_probe())
+        report = load("probe").format_probe_report(results, summary=summary)
+        self.assertIn("проверка /ISAPI/Security/userCheck", report)
+        self.assertIn("digest → 200", report)
+        run(client.async_close())
+
+    def test_empty_opaque_from_the_real_panel_is_echoed_over_the_wire(self):
+        """End-to-end: a panel that only accepts an echoed empty opaque."""
+        seen: list[str] = []
+
+        def handler(request):
+            auth = request.headers.get("authorization", "")
+            if not auth.lower().startswith("digest "):
+                return httpx.Response(401, headers={
+                    "WWW-Authenticate": 'Digest qop="auth", realm="DS-11A8BC2D", '
+                    'nonce="abc", stale="false", opaque="", domain="::"'})
+            seen.append(auth)
+            if 'opaque=""' not in auth:
+                return httpx.Response(401, headers={
+                    "WWW-Authenticate": 'Digest qop="auth", realm="DS-11A8BC2D", '
+                    'nonce="abc", stale="false", opaque="", domain="::"'})
+            return httpx.Response(200, text="<userCheck/>")
+
+        client = make_client(handler)
+        run(client.async_verify())
+        self.assertTrue(seen and 'opaque=""' in seen[0])
         run(client.async_close())
 
 

@@ -111,6 +111,12 @@ class ISAPIClient(ProbeMixin):
         self.first_challenge_raw: str = ""
         self.last_challenge_raw: str = ""
         self.last_auth_header: str = ""
+        #: Every auth attempt of the last request: (scheme, header, status).
+        #: The basic fallback must never hide what digest sent and got back.
+        self.last_attempts: list[tuple[str, str, int]] = []
+        #: True once any scheme returned 2xx — stops the one-shot basic rescue.
+        self._auth_proven = False
+        self._basic_rescue_tried = False
         # verify=False keeps client creation off the event loop's blocking path
         # (no certifi load) — we only ever talk plain HTTP to the panel anyway.
         self._client = httpx.AsyncClient(
@@ -164,6 +170,11 @@ class ISAPIClient(ProbeMixin):
                 f"{method} {url}: {redact(str(err), *self.secrets)}"
             ) from err
 
+    def _record_attempt(self, sent: str | None, status: int) -> None:
+        """Keep every attempt, so a basic fallback cannot hide the digest one."""
+        scheme = (sent or "").split(" ", 1)[0].lower() or "без заголовка"
+        self.last_attempts.append((scheme, safe_auth_header(sent), status))
+
     def _learn_challenge(self, resp: httpx.Response) -> bool:
         """Remember the digest challenge from a 401. False = none offered."""
         challenges = list(resp.headers.get_list("www-authenticate"))
@@ -188,12 +199,16 @@ class ISAPIClient(ProbeMixin):
         """
         url = f"{self._base}{path}"
         req_headers = dict(headers or {})
+        self.last_attempts = []
         sent = self._authorization(method, path)
         if sent:
             req_headers["Authorization"] = sent
         resp = await self._raw(method, url, body, req_headers)
         self.last_auth_header = safe_auth_header(sent)
+        self._record_attempt(sent, resp.status_code)
         if resp.status_code != 401:
+            if status_ok(resp.status_code):
+                self._auth_proven = True
             return resp
 
         challenges = list(resp.headers.get_list("www-authenticate"))
@@ -213,10 +228,12 @@ class ISAPIClient(ProbeMixin):
             req_headers["Authorization"] = sent
             resp = await self._raw(method, url, body, req_headers)
             self.last_auth_header = safe_auth_header(sent)
+            self._record_attempt(sent, resp.status_code)
             if status_ok(resp.status_code):
                 if self.auth_mode != AUTH_DIGEST:
                     _LOGGER.info("Панель приняла digest-авторизацию, запоминаем")
                 self.auth_mode = AUTH_DIGEST
+                self._auth_proven = True
                 return resp
             if resp.status_code == 401:
                 more = list(resp.headers.get_list("www-authenticate"))
@@ -225,7 +242,16 @@ class ISAPIClient(ProbeMixin):
                     self.last_challenge_raw = "; ".join(more)
 
         fallback = next_auth_mode(AUTH_DIGEST, 401, "; ".join(challenges))
-        if fallback != AUTH_BASIC or self.auth_mode == AUTH_BASIC:
+        if fallback != AUTH_BASIC:
+            # Digest was offered and digest failed => normally wrong
+            # credentials. Try basic exactly ONCE per client anyway: some
+            # firmwares advertise digest and accept only basic, and either
+            # way the attempt and its status land in the report.
+            if self._auth_proven or self._basic_rescue_tried:
+                return resp
+            self._basic_rescue_tried = True
+            _LOGGER.debug("digest не принят на %s — разовая проверка basic", path)
+        if self.auth_mode == AUTH_BASIC:
             return resp
 
         _LOGGER.debug("401 на %s — пробуем auth=basic", path)
@@ -233,9 +259,11 @@ class ISAPIClient(ProbeMixin):
         req_headers["Authorization"] = sent
         retry = await self._raw(method, url, body, req_headers)
         self.last_auth_header = safe_auth_header(sent)
+        self._record_attempt(sent, retry.status_code)
         if status_ok(retry.status_code):
             _LOGGER.info("Панель приняла basic-авторизацию, запоминаем")
             self.auth_mode = AUTH_BASIC
+            self._auth_proven = True
         return retry
 
     async def _request(self, call: Call) -> httpx.Response:

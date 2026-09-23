@@ -46,6 +46,17 @@ class Challenge:
     params: dict[str, str] = field(default_factory=dict)
 
     @property
+    def has_opaque(self) -> bool:
+        """True when the challenge CARRIES the key — even as an empty string.
+
+        DS-K1T341AM V3.2.30 sends `opaque=""`. RFC 7616 says the client must
+        echo the opaque value back unchanged, and Hikvision's parser is
+        literal: dropping the field because it looks empty is not the same as
+        echoing an empty one.
+        """
+        return "opaque" in self.params
+
+    @property
     def hash_name(self) -> str:
         name = (self.algorithm or "MD5").upper()
         return name if name in _HASHES else "MD5"
@@ -56,9 +67,15 @@ class Challenge:
             f"realm={self.realm!r} qop={self.qop or '—'} "
             f"algorithm={self.algorithm or '(не указан)'} "
             f"nonce={len(self.nonce)} симв. "
-            f"opaque={'да' if self.opaque else 'нет'}"
+            f"opaque={self._describe_opaque()}"
             + (f" stale={self.stale}" if self.stale else "")
         )
+
+
+    def _describe_opaque(self) -> str:
+        if not self.has_opaque:
+            return "нет"
+        return "пустой" if self.opaque == "" else f"{len(self.opaque)} симв."
 
 
 def parse_challenge(header: str | None) -> Challenge | None:
@@ -166,7 +183,8 @@ def build_authorization(
     if challenge.algorithm:
         parts.append(f"algorithm={challenge.algorithm}")
     parts.append(f'response="{response}"')
-    if challenge.opaque:
+    if challenge.has_opaque:
+        # Echoed verbatim, empty string included.
         parts.append(f'opaque="{challenge.opaque}"')
     if qop:
         parts.append(f"qop={qop}")
