@@ -53,8 +53,13 @@
 | Видеоканал | `101` — основной поток, `102` — дополнительный |
 | Поток событий (alertStream) | включён по умолчанию |
 
-Интеграция проверит связь с панелью при добавлении. Авторизация — **HTTP
-digest** (стандарт Hikvision) с автоматическим откатом на basic.
+Интеграция проверит связь с панелью при добавлении (`/ISAPI/Security/userCheck`,
+затем `/ISAPI/System/deviceInfo`). Авторизация — **HTTP digest**, посчитанный
+самой интеграцией (RFC 2069/2617/7616, MD5/MD5-sess/SHA-256) в том же порядке
+полей, что шлёт браузер: `algorithm` отправляется только если панель его
+предложила, `uri` подписывается вместе с query-строкой, ответ на 401 уходит по
+той же keep-alive TCP-сессии (прошивки Hikvision V3.x привязывают nonce к
+соединению). Откат на basic — если панель предлагает только его.
 
 ## Проверка панели (диагностика)
 
@@ -70,10 +75,15 @@ BMS Intercom — проверка панели 192.168.70.121
   модель: DS-K1T341AM V3.2.30
   авторизация: digest (успешно)
   RTSP: rtsp://***@192.168.70.121:554/Streaming/Channels/101
-   1. [OK  ] deviceInfo: GET  .../ISAPI/System/deviceInfo  -> 200  auth=digest  application/xml  | <DeviceInfo…
+   1. [OK  ] userCheck: GET  .../ISAPI/Security/userCheck  -> 200  auth=digest  application/xml  | <userCheck…
    7. [OK  ] snapshot:   GET  .../ISAPI/Streaming/channels/101/picture  -> 200  image/jpeg  | [12000 байт…]
   11. [FAIL] callStatus.json: GET .../ISAPI/VideoIntercom/callStatus?format=json -> 403 | Invalid Operation…
 ```
+
+При 401 в отчёт добавляются две строки: `challenge:` — заголовок
+`WWW-Authenticate` панели дословно, и `отправили:` — наш заголовок
+`Authorization` целиком (в digest пароля нет, только хэш `response=`; basic
+показывается как `Basic ***`).
 
 Реле двери при проверке **не срабатывает**. Чтобы проверить и его, вызовите
 службу с `test_door: true`.

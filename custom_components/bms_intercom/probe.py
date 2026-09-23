@@ -26,6 +26,11 @@ class ProbeResult:
     content_type: str = ""
     body: str = ""
     auth: str = ""
+    #: Verbatim `WWW-Authenticate` of a 401 — carries no secret, never redacted.
+    challenge: str = ""
+    #: What we put in `Authorization` (digest verbatim, basic reduced to the
+    #: scheme: its base64 payload *is* the password).
+    sent_auth: str = ""
     error: str = ""
     secrets: tuple[str | None, ...] = field(default=(), repr=False)
 
@@ -46,7 +51,12 @@ class ProbeResult:
         body = snippet(self.body, secrets=self.secrets)
         if body:
             parts.append(f"| {body}")
-        return "  ".join(parts)
+        line = "  ".join(parts)
+        if self.challenge:
+            line += f"\n        challenge: {self.challenge}"
+        if self.sent_auth:
+            line += f"\n        отправили: {self.sent_auth}"
+        return line
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -58,6 +68,8 @@ class ProbeResult:
             "auth": self.auth,
             "content_type": self.content_type,
             "body": snippet(self.body, secrets=self.secrets),
+            "challenge": self.challenge,
+            "sent_auth": self.sent_auth,
             "error": redact(self.error, *self.secrets),
         }
 

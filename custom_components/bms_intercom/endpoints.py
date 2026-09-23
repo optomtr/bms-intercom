@@ -102,6 +102,8 @@ def rtsp_url(
 def identity_calls() -> tuple[Call, ...]:
     """Reachability / credentials check."""
     return (
+        # userCheck is the endpoint a browser was proven on for DS-K1T341AM.
+        Call("userCheck", "GET", "/ISAPI/Security/userCheck"),
         Call("deviceInfo", "GET", "/ISAPI/System/deviceInfo"),
         Call("deviceInfo.json", "GET", "/ISAPI/System/deviceInfo?format=json"),
         Call("systemStatus", "GET", "/ISAPI/System/status"),

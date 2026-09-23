@@ -8,6 +8,8 @@ Run: python3 -m unittest discover -s tests -v   (skipped when httpx is absent)
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import unittest
 
 try:
@@ -29,6 +31,133 @@ def make_client(handler, **kwargs):
     client = isapi.ISAPIClient("192.168.70.121", "admin", "Sekret123!", **kwargs)
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return client
+
+
+class FakeDigestPanel:
+    """A panel that really checks the digest response (plain hashlib, no reuse
+    of the module under test), the way DS-K1T341AM does for a browser."""
+
+    def __init__(self, password="Sekret123!", *, qop="auth", algorithm="MD5",
+                 realm="DS-K1T341AM", nonce="0a1b2c3d4e5f6789"):
+        self.password = password
+        self.qop = qop
+        self.algorithm = algorithm
+        self.realm = realm
+        self.nonce = nonce
+        self.seen: list[str] = []      # Authorization headers received
+        self.challenges_sent = 0
+
+    def challenge(self) -> str:
+        parts = [f'realm="{self.realm}"', f'nonce="{self.nonce}"']
+        if self.qop:
+            parts.append(f'qop="{self.qop}"')
+        if self.algorithm:
+            parts.append(f"algorithm={self.algorithm}")
+        return "Digest " + ", ".join(parts)
+
+    def _unauthorized(self):
+        self.challenges_sent += 1
+        return httpx.Response(401, headers={"WWW-Authenticate": self.challenge()})
+
+    def expected(self, params, method, raw_path):
+        ha1 = hashlib.md5(
+            f"admin:{self.realm}:{self.password}".encode()
+        ).hexdigest()
+        ha2 = hashlib.md5(f"{method}:{raw_path}".encode()).hexdigest()
+        if self.qop:
+            return hashlib.md5(
+                f"{ha1}:{self.nonce}:{params['nc']}:{params['cnonce']}:"
+                f"{params['qop']}:{ha2}".encode()
+            ).hexdigest()
+        return hashlib.md5(f"{ha1}:{self.nonce}:{ha2}".encode()).hexdigest()
+
+    def __call__(self, request: "httpx.Request") -> "httpx.Response":
+        auth = request.headers.get("authorization", "")
+        self.seen.append(auth)
+        if not auth.lower().startswith("digest "):
+            return self._unauthorized()
+        params = dict(
+            (m.group(1).lower(), m.group(2) or m.group(3))
+            for m in re.finditer(
+                r'(\w+)=(?:"([^"]*)"|([^,\s]+))', auth[7:]
+            )
+        )
+        raw_path = request.url.raw_path.decode()
+        if params.get("uri") != raw_path:
+            return self._unauthorized()   # uri must match what we received
+        if params.get("response") != self.expected(params, request.method, raw_path):
+            return self._unauthorized()
+        return httpx.Response(
+            200, headers={"Content-Type": "application/xml"},
+            text="<userCheck><statusValue>200</statusValue></userCheck>",
+        )
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class TestRealDigest(unittest.TestCase):
+    """End-to-end against a panel that verifies the hash for real."""
+
+    def test_challenge_is_answered_correctly(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        run(client.async_verify())
+        self.assertEqual(client.auth_mode, "digest")
+        self.assertEqual(panel.seen[0], "")            # first request is bare
+        self.assertTrue(panel.seen[1].startswith("Digest "))
+        self.assertEqual(panel.challenges_sent, 1)     # exactly one 401
+        run(client.async_close())
+
+    def test_next_request_reuses_the_challenge_with_nc_incremented(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        run(client.async_verify())
+        panel.seen.clear()
+        run(client.async_get_call_status())
+        self.assertTrue(panel.seen[0].startswith("Digest "))
+        self.assertIn("nc=00000002", panel.seen[0])    # no second 401 needed
+        run(client.async_close())
+
+    def test_query_string_is_part_of_the_signed_uri(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        run(client.async_get_call_status())  # /…/callStatus?format=json
+        signed = [a for a in panel.seen if a.startswith("Digest ")][0]
+        self.assertIn('uri="/ISAPI/VideoIntercom/callStatus?format=json"', signed)
+        run(client.async_close())
+
+    def test_panel_without_qop_or_algorithm_still_authenticates(self):
+        panel = FakeDigestPanel(qop="", algorithm="")
+        client = make_client(panel)
+        run(client.async_verify())
+        self.assertEqual(client.auth_mode, "digest")
+        signed = [a for a in panel.seen if a.startswith("Digest ")][0]
+        self.assertNotIn("qop=", signed)
+        self.assertNotIn("algorithm", signed)
+        run(client.async_close())
+
+    def test_wrong_password_does_not_loop_forever(self):
+        panel = FakeDigestPanel(password="another-one")
+        client = make_client(panel)
+        with self.assertRaises(isapi.ISAPIAuthError):
+            run(client.async_verify())
+        # one bare + one signed attempt per candidate endpoint, no retry storm
+        self.assertLessEqual(len(panel.seen), 2 * 4)
+        run(client.async_close())
+
+    def test_probe_report_shows_the_challenge_and_what_we_sent(self):
+        panel = FakeDigestPanel(password="another-one")   # every request 401s
+        client = make_client(panel)
+        results, summary = run(client.async_probe())
+        report = load("probe").format_probe_report(
+            results, host="192.168.70.121", summary=summary
+        )
+        self.assertIn('Digest realm="DS-K1T341AM"', report)   # verbatim header
+        self.assertIn("nonce=16 симв.", report)               # parsed challenge
+        self.assertIn('username="admin"', report)             # what we sent
+        self.assertIn("response=", report)
+        self.assertNotIn("another-one", report)               # never the password
+        self.assertIn("WWW-Authenticate (первый 401)", report)
+        run(client.async_close())
 
 
 @unittest.skipIf(httpx is None, "httpx not installed")

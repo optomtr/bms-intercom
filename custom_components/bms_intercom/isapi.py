@@ -39,6 +39,13 @@ from .endpoints import (
     stream_info_paths,
     tolerate,
 )
+from .digest import (
+    Challenge,
+    basic_authorization,
+    build_authorization,
+    pick_digest_challenge,
+    safe_auth_header,
+)
 from .events import (
     STATE_ANSWERED,
     STATE_IDLE,
@@ -96,11 +103,29 @@ class ISAPIClient:
         self._channel = channel or DEFAULT_CHANNEL
         self._base = f"http://{host}:{http_port}"
         self.auth_mode = AUTH_DIGEST
-        self._digest = httpx.DigestAuth(username, password)
-        self._basic = httpx.BasicAuth(username, password)
+        # Digest state. Hikvision V3.x binds the nonce to the TCP connection,
+        # so the challenge and the authenticated retry must share one
+        # keep-alive connection — hence a single long-lived client with
+        # http1 only, no redirects and no environment proxy in between.
+        self._challenge: Challenge | None = None
+        self._nc = 0
+        # Diagnostics (no secrets): what the panel asked for and what we sent.
+        self.first_challenge_raw: str = ""
+        self.last_challenge_raw: str = ""
+        self.last_auth_header: str = ""
         # verify=False keeps client creation off the event loop's blocking path
         # (no certifi load) — we only ever talk plain HTTP to the panel anyway.
-        self._client = httpx.AsyncClient(timeout=timeout, verify=False)
+        self._client = httpx.AsyncClient(
+            timeout=timeout,
+            verify=False,
+            http1=True,
+            http2=False,
+            follow_redirects=False,
+            trust_env=False,
+            limits=httpx.Limits(
+                max_connections=4, max_keepalive_connections=4, keepalive_expiry=300.0
+            ),
+        )
         # Endpoint shapes learned at runtime.
         self._rtsp_path: str | None = None
         self._snapshot_path: str | None = None
@@ -114,41 +139,105 @@ class ISAPIClient:
     def secrets(self) -> tuple[str, ...]:
         return (self._password,)
 
-    def _auth(self, mode: str) -> httpx.Auth:
-        return self._basic if mode == AUTH_BASIC else self._digest
-
     async def async_close(self) -> None:
         await self._client.aclose()
+
+    def _authorization(self, method: str, target: str) -> str | None:
+        """Header to send up front with the scheme we already know works."""
+        if self.auth_mode == AUTH_BASIC:
+            return basic_authorization(self._username, self._password)
+        if self._challenge is not None:
+            self._nc += 1
+            return build_authorization(
+                self._username, self._password, method, target,
+                self._challenge, nc=self._nc,
+            )
+        return None
+
+    async def _raw(
+        self, method: str, url: str, body: str | None, headers: dict[str, str]
+    ) -> httpx.Response:
+        try:
+            return await self._client.request(
+                method, url, content=body, headers=headers
+            )
+        except httpx.HTTPError as err:
+            raise ISAPIError(
+                f"{method} {url}: {redact(str(err), *self.secrets)}"
+            ) from err
+
+    def _learn_challenge(self, resp: httpx.Response) -> bool:
+        """Remember the digest challenge from a 401. False = none offered."""
+        challenges = list(resp.headers.get_list("www-authenticate"))
+        self.last_challenge_raw = "; ".join(challenges) or "(заголовок не прислан)"
+        if not self.first_challenge_raw:
+            self.first_challenge_raw = self.last_challenge_raw
+        challenge = pick_digest_challenge(challenges)
+        if challenge is None:
+            return False
+        self._challenge = challenge
+        self._nc = 0
+        return True
 
     async def _send(
         self, method: str, path: str, *, body: str | None = None,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """One request with the remembered auth scheme, retried once on 401."""
-        url = f"{self._base}{path}"
-        try:
-            resp = await self._client.request(
-                method, url, content=body, headers=headers, auth=self._auth(self.auth_mode)
-            )
-        except httpx.HTTPError as err:
-            raise ISAPIError(f"{method} {path}: {redact(str(err), *self.secrets)}") from err
+        """One request, answering a 401 challenge on the same connection.
 
-        fallback = next_auth_mode(
-            self.auth_mode, resp.status_code, resp.headers.get("www-authenticate")
-        )
-        if fallback is None:
+        `path` is used verbatim as the digest `uri` (query string included) —
+        the panel hashes the request target it received.
+        """
+        url = f"{self._base}{path}"
+        req_headers = dict(headers or {})
+        sent = self._authorization(method, path)
+        if sent:
+            req_headers["Authorization"] = sent
+        resp = await self._raw(method, url, body, req_headers)
+        self.last_auth_header = safe_auth_header(sent)
+        if resp.status_code != 401:
             return resp
 
-        _LOGGER.debug("401 на %s — пробуем auth=%s", path, fallback)
-        try:
-            retry = await self._client.request(
-                method, url, content=body, headers=headers, auth=self._auth(fallback)
+        challenges = list(resp.headers.get_list("www-authenticate"))
+        self.last_challenge_raw = "; ".join(challenges) or "(заголовок не прислан)"
+        if not self.first_challenge_raw:
+            self.first_challenge_raw = self.last_challenge_raw
+        challenge = pick_digest_challenge(challenges)
+
+        if challenge is not None:
+            # Fresh nonce from this very 401, answered immediately so the
+            # connection (and the nonce bound to it) is still the same one.
+            self._challenge = challenge
+            self._nc = 1
+            sent = build_authorization(
+                self._username, self._password, method, path, challenge, nc=1
             )
-        except httpx.HTTPError as err:
-            raise ISAPIError(f"{method} {path}: {redact(str(err), *self.secrets)}") from err
+            req_headers["Authorization"] = sent
+            resp = await self._raw(method, url, body, req_headers)
+            self.last_auth_header = safe_auth_header(sent)
+            if status_ok(resp.status_code):
+                if self.auth_mode != AUTH_DIGEST:
+                    _LOGGER.info("Панель приняла digest-авторизацию, запоминаем")
+                self.auth_mode = AUTH_DIGEST
+                return resp
+            if resp.status_code == 401:
+                more = list(resp.headers.get_list("www-authenticate"))
+                if more:
+                    challenges = more
+                    self.last_challenge_raw = "; ".join(more)
+
+        fallback = next_auth_mode(AUTH_DIGEST, 401, "; ".join(challenges))
+        if fallback != AUTH_BASIC or self.auth_mode == AUTH_BASIC:
+            return resp
+
+        _LOGGER.debug("401 на %s — пробуем auth=basic", path)
+        sent = basic_authorization(self._username, self._password)
+        req_headers["Authorization"] = sent
+        retry = await self._raw(method, url, body, req_headers)
+        self.last_auth_header = safe_auth_header(sent)
         if status_ok(retry.status_code):
-            _LOGGER.info("Панель приняла авторизацию %s, запоминаем", fallback)
-            self.auth_mode = fallback
+            _LOGGER.info("Панель приняла basic-авторизацию, запоминаем")
+            self.auth_mode = AUTH_BASIC
         return retry
 
     async def _request(self, call: Call) -> httpx.Response:
@@ -324,22 +413,30 @@ class ISAPIClient:
         url = f"{self._base}{path}"
         parser = AlertStreamParser()
         timeout = httpx.Timeout(10.0, read=ALERT_READ_TIMEOUT)
-        for mode in (self.auth_mode, AUTH_BASIC if self.auth_mode == AUTH_DIGEST else AUTH_DIGEST):
+        # First attempt with what we know, second answering the 401 challenge.
+        for attempt in (0, 1):
+            headers: dict[str, str] = {}
+            sent = self._authorization("GET", path)
+            if sent:
+                headers["Authorization"] = sent
             try:
                 async with self._client.stream(
-                    "GET", url, auth=self._auth(mode), timeout=timeout
+                    "GET", url, headers=headers, timeout=timeout
                 ) as resp:
                     if resp.status_code == 401:
-                        continue  # try the other scheme once
+                        await resp.aread()
+                        if not self._learn_challenge(resp):
+                            raise ISAPIAuthError("alertStream: 401 Unauthorized")
+                        continue  # retry with the fresh challenge
                     if status_missing(resp.status_code):
                         raise ISAPIUnsupported(
                             f"alertStream: HTTP {resp.status_code} — модель не умеет поток событий"
                         )
                     if not status_ok(resp.status_code):
                         raise ISAPIError(f"alertStream: HTTP {resp.status_code}")
-                    if mode != self.auth_mode:
-                        self.auth_mode = mode
-                    _LOGGER.debug("alertStream подключён (auth=%s)", mode)
+                    _LOGGER.debug(
+                        "alertStream подключён (auth=%s)", self.auth_mode
+                    )
                     if on_connect is not None:
                         on_connect()
                     async for chunk in resp.aiter_bytes():
@@ -367,6 +464,9 @@ class ISAPIClient:
             return result
         result.status = resp.status_code
         result.auth = self.auth_mode
+        result.sent_auth = self.last_auth_header
+        if resp.status_code == 401:
+            result.challenge = self.last_challenge_raw
         result.content_type = resp.headers.get("content-type", "")
         if result.content_type.startswith(("image/", "video/", "application/octet")):
             result.body = f"[{len(resp.content)} байт двоичных данных]"
@@ -421,6 +521,13 @@ class ISAPIClient:
         working = [r for r in results if r.ok]
         summary: dict[str, Any] = {
             "модель": self._device_model(results),
+            "WWW-Authenticate (первый 401)": self.first_challenge_raw or "(401 не было)",
+            "разбор вызова": (
+                self._challenge.describe() if self._challenge else "(digest не предложен)"
+            ),
+            "Authorization (последний отправленный)": (
+                self.last_auth_header or "(не отправляли)"
+            ),
             "авторизация": (
                 f"{self.auth_mode} (успешно)" if working else f"{self.auth_mode} (ни один запрос не прошёл)"
             ),
@@ -441,14 +548,24 @@ class ISAPIClient:
             name="alertStream", method="GET", url=f"{self._base}{path}",
             secrets=self.secrets,
         )
+        headers: dict[str, str] = {}
+        sent = self._authorization("GET", path)
+        if sent:
+            headers["Authorization"] = sent
         try:
             async with self._client.stream(
                 "GET", f"{self._base}{path}",
-                auth=self._auth(self.auth_mode),
+                headers=headers,
                 timeout=httpx.Timeout(10.0, read=8.0),
             ) as resp:
                 result.status = resp.status_code
                 result.auth = self.auth_mode
+                result.sent_auth = safe_auth_header(sent)
+                if resp.status_code == 401:
+                    await resp.aread()
+                    result.challenge = "; ".join(
+                        resp.headers.get_list("www-authenticate")
+                    ) or "(заголовок не прислан)"
                 result.content_type = resp.headers.get("content-type", "")
                 if status_ok(resp.status_code):
                     try:
