@@ -23,7 +23,13 @@ class BMSIntercomEntity(Entity):
 
     @property
     def available(self) -> bool:
-        return self.device.available
+        """Entities never disappear when the panel is unreachable.
+
+        A panel that does not answer makes the call state unknown, not the
+        entity unavailable — otherwise the owner cannot press «Проверить
+        панель» to find out why it does not answer.
+        """
+        return True
 
     @property
     def intercom_attributes(self) -> dict[str, str]:
@@ -37,6 +43,12 @@ class BMSIntercomEntity(Entity):
         if self.device.https_url:
             attrs["intercom_https_base"] = self.device.https_url
         attrs["intercom_https_port"] = str(self.device.proxy_port)
+        panel = self.device.panel_available
+        attrs["panel_available"] = (
+            "unknown" if panel is None else ("yes" if panel else "no")
+        )
+        if self.device.last_error:
+            attrs["panel_error"] = self.device.last_error
         return attrs
 
     @property

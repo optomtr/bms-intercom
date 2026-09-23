@@ -13,22 +13,28 @@ from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_USERNA
 from homeassistant.core import callback
 
 from .const import (
+    CONF_CALL_TIMEOUT,
+    CONF_CHANNEL,
     CONF_DOOR_NO,
     CONF_HTTP_PORT,
     CONF_HTTPS_URL,
     CONF_MODE,
     CONF_PROXY_PORT,
     CONF_RTSP_PORT,
+    CONF_USE_ALERT_STREAM,
+    DEFAULT_CALL_TIMEOUT,
+    DEFAULT_CHANNEL,
     DEFAULT_DOOR_NO,
     DEFAULT_HTTP_PORT,
     DEFAULT_NAME,
     DEFAULT_PROXY_PORT,
     DEFAULT_RTSP_PORT,
+    DEFAULT_USE_ALERT_STREAM,
     DOMAIN,
     MODE_DEMO,
     MODE_REAL,
 )
-from .isapi import ISAPIClient, ISAPIError
+from .isapi import ISAPIAuthError, ISAPIClient, ISAPIError
 
 
 class BMSIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -64,10 +70,14 @@ class BMSIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
                 user_input[CONF_USERNAME],
                 user_input[CONF_PASSWORD],
                 http_port=user_input[CONF_HTTP_PORT],
+                rtsp_port=user_input[CONF_RTSP_PORT],
                 door_no=user_input[CONF_DOOR_NO],
+                channel=user_input[CONF_CHANNEL],
             )
             try:
                 await client.async_verify()
+            except ISAPIAuthError:
+                errors["base"] = "invalid_auth"
             except ISAPIError:
                 errors["base"] = "cannot_connect"
             finally:
@@ -88,6 +98,10 @@ class BMSIntercomConfigFlow(ConfigFlow, domain=DOMAIN):
                 vol.Optional(CONF_HTTP_PORT, default=DEFAULT_HTTP_PORT): int,
                 vol.Optional(CONF_RTSP_PORT, default=DEFAULT_RTSP_PORT): int,
                 vol.Optional(CONF_DOOR_NO, default=DEFAULT_DOOR_NO): int,
+                vol.Optional(CONF_CHANNEL, default=DEFAULT_CHANNEL): int,
+                vol.Optional(
+                    CONF_USE_ALERT_STREAM, default=DEFAULT_USE_ALERT_STREAM
+                ): bool,
             }
         )
         return self.async_show_form(
@@ -105,24 +119,54 @@ class BMSIntercomOptionsFlow(OptionsFlow):
             if url and not url.startswith("https://"):
                 errors["base"] = "https_required"
             else:
-                return self.async_create_entry(
-                    title="",
-                    data={
-                        CONF_PROXY_PORT: user_input.get(CONF_PROXY_PORT, DEFAULT_PROXY_PORT),
-                        CONF_HTTPS_URL: url,
-                    },
-                )
+                data = {
+                    CONF_PROXY_PORT: user_input.get(
+                        CONF_PROXY_PORT, DEFAULT_PROXY_PORT
+                    ),
+                    CONF_HTTPS_URL: url,
+                    CONF_CALL_TIMEOUT: user_input.get(
+                        CONF_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT
+                    ),
+                }
+                if CONF_CHANNEL in user_input:
+                    data[CONF_CHANNEL] = user_input[CONF_CHANNEL]
+                if CONF_USE_ALERT_STREAM in user_input:
+                    data[CONF_USE_ALERT_STREAM] = user_input[CONF_USE_ALERT_STREAM]
+                return self.async_create_entry(title="", data=data)
 
         opts = self.config_entry.options
-        schema = vol.Schema(
-            {
+        data = self.config_entry.data
+        fields: dict = {
+            vol.Optional(
+                CONF_PROXY_PORT,
+                default=opts.get(CONF_PROXY_PORT, DEFAULT_PROXY_PORT),
+            ): int,
+            vol.Optional(CONF_HTTPS_URL, default=opts.get(CONF_HTTPS_URL, "")): str,
+            vol.Optional(
+                CONF_CALL_TIMEOUT,
+                default=opts.get(CONF_CALL_TIMEOUT, DEFAULT_CALL_TIMEOUT),
+            ): int,
+        }
+        # Panel-only options: hidden for a demo intercom.
+        if CONF_HOST in data:
+            fields[
                 vol.Optional(
-                    CONF_PROXY_PORT,
-                    default=opts.get(CONF_PROXY_PORT, DEFAULT_PROXY_PORT),
-                ): int,
-                vol.Optional(CONF_HTTPS_URL, default=opts.get(CONF_HTTPS_URL, "")): str,
-            }
-        )
+                    CONF_CHANNEL,
+                    default=opts.get(
+                        CONF_CHANNEL, data.get(CONF_CHANNEL, DEFAULT_CHANNEL)
+                    ),
+                )
+            ] = int
+            fields[
+                vol.Optional(
+                    CONF_USE_ALERT_STREAM,
+                    default=opts.get(
+                        CONF_USE_ALERT_STREAM,
+                        data.get(CONF_USE_ALERT_STREAM, DEFAULT_USE_ALERT_STREAM),
+                    ),
+                )
+            ] = bool
+        schema = vol.Schema(fields)
         return self.async_show_form(
             step_id="init", data_schema=schema, errors=errors
         )

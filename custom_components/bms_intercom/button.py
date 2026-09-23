@@ -1,9 +1,12 @@
-"""Buttons to drive the intercom: simulate call, answer, reject, open door."""
+"""Buttons to drive the intercom: answer, reject, open door, probe the panel."""
 from __future__ import annotations
+
+from typing import Any
 
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN
@@ -21,6 +24,7 @@ async def async_setup_entry(
         AnswerButton(device),
         RejectButton(device),
         OpenDoorButton(device),
+        ProbeButton(device),
     ]
     # The "simulate call" button only makes sense without real hardware.
     if device.is_demo:
@@ -74,3 +78,26 @@ class OpenDoorButton(BMSIntercomEntity, ButtonEntity):
 
     async def async_press(self) -> None:
         await self.device.async_open_door()
+
+
+class ProbeButton(BMSIntercomEntity, ButtonEntity):
+    """Diagnostics: ask the panel which ISAPI endpoints it actually supports.
+
+    The report goes to the Home Assistant log and into this entity's
+    attributes (`probe_report`). It never contains the password.
+    """
+
+    _attr_name = "Проверить панель"
+    _attr_icon = "mdi:stethoscope"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _intercom_role = "probe"
+
+    def __init__(self, device: BMSIntercomDevice) -> None:
+        super().__init__(device, "probe")
+
+    async def async_press(self) -> None:
+        await self.device.async_probe()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {**self.intercom_attributes, **self.device.probe_attributes}

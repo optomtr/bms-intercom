@@ -31,7 +31,10 @@ class CallBinarySensor(BMSIntercomEntity, BinarySensorEntity):
         super().__init__(device, "call")
 
     @property
-    def is_on(self) -> bool:
+    def is_on(self) -> bool | None:
+        """None (unknown) while the panel is unreachable — never a false 'off'."""
+        if self.device.panel_available is False:
+            return None
         return self.device.call_active
 
     @property

@@ -53,14 +53,18 @@ class IntercomCamera(BMSIntercomEntity, Camera):
     async def stream_source(self) -> str | None:
         if self.device.is_demo:
             return None
-        return self.device.rtsp_url
+        # Confirms the channel over ISAPI first: DS-K1T341AM answers
+        # /Streaming/Channels/101, while the legacy /1 gives 400 Bad Request.
+        return await self.device.async_stream_source()
 
     async def async_camera_image(
         self, width: int | None = None, height: int | None = None
     ) -> bytes | None:
         if self.device.is_demo:
             return await self.hass.async_add_executor_job(self._render_demo_frame)
-        return None
+        # Real panel: ISAPI still image (digest auth) — this is what the stock
+        # hikvision integration got wrong with "Authentication failed".
+        return await self.device.async_snapshot()
 
     async def handle_async_mjpeg_stream(self, request):
         """Demo mode streams generated frames; real mode falls back to HA."""
