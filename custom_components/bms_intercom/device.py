@@ -38,16 +38,10 @@ from .callsource import (
     STATE_RINGING,
     CallSourceMixin,
 )
-from .isapi import STATUS_ANSWERED, STATUS_RINGING, ISAPIClient, ISAPIError
+from .isapi import ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
 
 _LOGGER = logging.getLogger(__name__)
-
-# Panel call-status string -> internal call state.
-_ISAPI_STATUS_TO_STATE = {
-    STATUS_RINGING: STATE_RINGING,
-    STATUS_ANSWERED: STATE_ANSWERED,
-}
 
 
 class BMSIntercomDevice(CallSourceMixin):
@@ -298,7 +292,9 @@ class BMSIntercomDevice(CallSourceMixin):
         _LOGGER.info("[%s] Команда открытия двери отправлена", self.name)
 
     # --- diagnostics -------------------------------------------------------
-    async def async_probe(self, *, test_door: bool = False) -> str:
+    async def async_probe(
+        self, *, test_door: bool = False, acs_minutes: int = 15
+    ) -> str:
         """Probe every candidate endpoint, log the report and keep it in attrs.
 
         Works regardless of the panel being reachable — that is the point.
@@ -317,7 +313,9 @@ class BMSIntercomDevice(CallSourceMixin):
             return report
 
         try:
-            results, summary = await self._client.async_probe(test_door=test_door)
+            results, summary = await self._client.async_probe(
+                test_door=test_door, acs_minutes=acs_minutes
+            )
         except Exception as err:  # noqa: BLE001 - diagnostics must never raise
             _LOGGER.exception("[%s] Проверка панели сорвалась: %s", self.name, err)
             results, summary = [], {"ошибка": str(err)}
@@ -328,8 +326,14 @@ class BMSIntercomDevice(CallSourceMixin):
             "панель на связи",
             {True: "да", False: "нет", None: "не проверялась"}[self.panel_available],
         )
-        report = format_probe_report(results, host=host, summary=summary)
-        self.probe_attributes = report_attributes(results, host=host, summary=summary)
+        sections = self._client.probe_sections if self._client else []
+        events = self._client.probe_acs_events if self._client else []
+        report = format_probe_report(
+            results, host=host, summary=summary, sections=sections
+        )
+        self.probe_attributes = report_attributes(
+            results, host=host, summary=summary, sections=sections, events=events
+        )
         # WARNING so it lands in the log without turning on debug for anyone.
         _LOGGER.warning("%s", report)
         if any(r.ok for r in results):

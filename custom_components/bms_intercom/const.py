@@ -57,6 +57,7 @@ ALERT_BACKOFF_MAX = 60
 # Service exposed for diagnostics: bms_intercom.probe
 SERVICE_PROBE = "probe"
 ATTR_TEST_DOOR = "test_door"
+ATTR_MINUTES = "minutes"
 
 PLATFORMS: list[Platform] = [
     Platform.CAMERA,

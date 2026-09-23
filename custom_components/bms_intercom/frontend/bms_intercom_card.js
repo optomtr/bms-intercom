@@ -21,15 +21,20 @@
   let micStream = null; // активный поток микрофона оператора (если разрешён)
   let lastSig = null;  // подпись текущего состояния, чтобы не перерисовывать зря
 
+  // hass есть не всегда целиком: пока фронтенд загружается или
+  // переподключает websocket, объект уже существует, а states ещё нет.
   function getHass() {
     const el = document.querySelector("home-assistant");
-    return el && el.hass ? el.hass : null;
+    const hass = el && el.hass;
+    return hass && hass.states && typeof hass.states === "object" ? hass : null;
   }
 
   // Сгруппировать сущности всех домофонов по intercom_id.
   function groupIntercoms(hass) {
     const groups = {};
-    for (const st of Object.values(hass.states)) {
+    const states = (hass && hass.states) || {};
+    for (const st of Object.values(states)) {
+      if (!st) continue;
       const a = st.attributes || {};
       const id = a.intercom_id;
       if (!id) continue;
@@ -225,8 +230,9 @@
 
     // Видео: MJPEG-поток камеры (демо-кадры или реальный поток панели).
     const img = overlay.querySelector(".bms-video");
-    if (cam && hass.states[cam]) {
-      const token = hass.states[cam].attributes.access_token;
+    const camState = cam && hass.states ? hass.states[cam] : null;
+    const token = camState && camState.attributes ? camState.attributes.access_token : null;
+    if (token) {
       const url = `/api/camera_proxy_stream/${cam}?token=${token}`;
       if (img.dataset.src !== url) { img.dataset.src = url; img.src = url; }
     }
@@ -246,6 +252,20 @@
     img.src = ""; img.dataset.src = "";
     activeId = null;
     lastSig = null;
+  }
+
+  // Один сбой не должен сыпать ошибку в консоль каждые 400 мс.
+  let tickErrorLogged = false;
+  function safeTick() {
+    try {
+      tick();
+    } catch (err) {
+      if (!tickErrorLogged) {
+        tickErrorLogged = true;
+        // eslint-disable-next-line no-console
+        console.warn("BMS Intercom: пропущен цикл поп-апа", err);
+      }
+    }
   }
 
   function tick() {
@@ -271,7 +291,7 @@
     showFor(pick[0], pick[1]);
   }
 
-  setInterval(tick, POLL_MS);
+  setInterval(safeTick, POLL_MS);
 
   // Также регистрируем как именованную карточку (можно добавить вручную, опционально).
   class BmsIntercomCard extends HTMLElement {
@@ -288,6 +308,10 @@
     name: "BMS Intercom (поп-ап)",
     description: "Поп-ап вызова работает автоматически; отдельная карточка не требуется.",
   });
+
+  if (window.__BMS_INTERCOM_TEST__) {
+    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick };
+  }
 
   // eslint-disable-next-line no-console
   console.info("%cBMS Intercom поп-ап загружен", "color:#2f6fed;font-weight:600");

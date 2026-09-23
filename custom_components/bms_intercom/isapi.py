@@ -11,6 +11,7 @@ answer/reject endpoint must never make an entity unavailable.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, AsyncIterator, Callable
 
@@ -48,6 +49,7 @@ from .events import (
 from .probing import ProbeMixin
 from .transport import (
     AuthTransportMixin,
+    describe_error,
     ISAPIAuthError,
     ISAPIError,
     ISAPIUnsupported,
@@ -62,6 +64,9 @@ STATUS_ANSWERED = STATE_ANSWERED
 
 # The panel is quiet between calls; reconnect if nothing arrives for this long.
 ALERT_READ_TIMEOUT = 300.0
+# How long to wait for the stream's response HEADERS. Bounded separately so a
+# panel that never answers cannot hold us for the whole read timeout.
+ALERT_HANDSHAKE_TIMEOUT = 15.0
 
 
 class ISAPIClient(AuthTransportMixin, ProbeMixin):
@@ -139,6 +144,9 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         self.call_signal_supported: bool | None = None
         self.alert_stream_supported: bool | None = None
         self.capabilities_raw: str = ""
+        # Filled by async_probe(): extra report sections and the event log.
+        self.probe_sections: list[str] = []
+        self.probe_acs_events: list[dict[str, Any]] = []
         self._unknown_status_logged: set[str] = set()
 
     # --- capabilities ------------------------------------------------------
@@ -310,7 +318,14 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
     async def async_iter_alerts(
         self, on_connect: Callable[[], None] | None = None
     ) -> AsyncIterator[dict[str, Any]]:
-        """Yield parsed events from the long-lived alertStream connection."""
+        """Yield parsed events from the long-lived alertStream connection.
+
+        The handshake (response headers) is bounded by ALERT_HANDSHAKE_TIMEOUT;
+        only an established 200 stream gets the long read timeout. A 401 body
+        is never read — the challenge is in the headers, and a panel that does
+        not terminate that body would otherwise hang us for the whole read
+        timeout and surface as an empty-message timeout instead of the 404.
+        """
         path = alert_stream_paths()[0]
         url = f"{self._base}{path}"
         parser = AlertStreamParser()
@@ -321,34 +336,44 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
             sent = self._stream_authorization("GET", path, attempt)
             if sent:
                 headers["Authorization"] = sent
+            request = self._client.build_request(
+                "GET", url, headers=headers, timeout=timeout
+            )
             try:
-                async with self._client.stream(
-                    "GET", url, headers=headers, timeout=timeout
-                ) as resp:
-                    if resp.status_code == 401:
-                        await resp.aread()
-                        if not self._learn_challenge(resp):
-                            raise ISAPIAuthError("alertStream: 401 Unauthorized")
-                        continue  # retry with the fresh challenge
-                    if status_missing(resp.status_code):
-                        self.alert_stream_supported = False
-                        raise ISAPIUnsupported(
-                            f"alertStream: HTTP {resp.status_code} — модель не умеет поток событий"
-                        )
-                    if not status_ok(resp.status_code):
-                        raise ISAPIError(f"alertStream: HTTP {resp.status_code}")
-                    _LOGGER.debug(
-                        "alertStream подключён (auth=%s)", self.auth_mode
+                resp = await asyncio.wait_for(
+                    self._client.send(request, stream=True),
+                    ALERT_HANDSHAKE_TIMEOUT,
+                )
+            except (httpx.HTTPError, TimeoutError) as err:
+                raise ISAPIError(
+                    f"alertStream: {redact(describe_error(err), *self.secrets)}"
+                ) from err
+            try:
+                if resp.status_code == 401:
+                    if not self._learn_challenge(resp):
+                        raise ISAPIAuthError("alertStream: 401 Unauthorized")
+                    continue  # retry with the fresh challenge (finally closes)
+                if status_missing(resp.status_code):
+                    self.alert_stream_supported = False
+                    raise ISAPIUnsupported(
+                        f"alertStream: HTTP {resp.status_code} — "
+                        "модель не умеет поток событий"
                     )
-                    self.alert_stream_supported = True
-                    if on_connect is not None:
-                        on_connect()
+                if not status_ok(resp.status_code):
+                    raise ISAPIError(f"alertStream: HTTP {resp.status_code}")
+                _LOGGER.debug("alertStream подключён (auth=%s)", self.auth_mode)
+                self.alert_stream_supported = True
+                if on_connect is not None:
+                    on_connect()
+                try:
                     async for chunk in resp.aiter_bytes():
                         for event in parser.feed(chunk):
                             yield event
-                    return
-            except httpx.HTTPError as err:
-                raise ISAPIError(
-                    f"alertStream: {redact(str(err), *self.secrets)}"
-                ) from err
+                except httpx.HTTPError as err:
+                    raise ISAPIError(
+                        f"alertStream: {redact(describe_error(err), *self.secrets)}"
+                    ) from err
+                return
+            finally:
+                await resp.aclose()
         raise ISAPIAuthError("alertStream: 401 Unauthorized")

@@ -41,6 +41,25 @@ class ISAPIUnsupported(ISAPIError):
     """The panel does not have this endpoint at all (404/405/501/…)."""
 
 
+class ISAPIStatusError(ISAPIError):
+    """The panel ANSWERED, with a non-2xx status (as opposed to not answering)."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def describe_error(err: BaseException) -> str:
+    """Never an empty reason in the log.
+
+    httpx timeouts often stringify to "" — which is exactly how the field log
+    ended up saying `Панель недоступна: alertStream:` with nothing after it.
+    """
+    text = str(err).strip()
+    name = type(err).__name__
+    return f"{name}: {text}" if text else name
+
+
 class AuthTransportMixin:
     """HTTP plumbing half of ISAPIClient."""
 
@@ -108,7 +127,7 @@ class AuthTransportMixin:
             )
         except httpx.HTTPError as err:
             raise ISAPIError(
-                f"{method} {url}: {redact(str(err), *self.secrets)}"
+                f"{method} {url}: {redact(describe_error(err), *self.secrets)}"
             ) from err
 
     def _record_attempt(self, sent: str | None, status: int) -> None:
@@ -227,7 +246,9 @@ class AuthTransportMixin:
             raise ISAPIAuthError(
                 f"{call.method} {call.path}: 401 Unauthorized (auth={self.auth_mode})"
             )
-        raise ISAPIError(f"{call.method} {call.path}: HTTP {resp.status_code}")
+        raise ISAPIStatusError(
+            f"{call.method} {call.path}: HTTP {resp.status_code}", resp.status_code
+        )
 
     async def _call_selected(
         self, candidates: tuple[Call, ...], slot: str
@@ -242,21 +263,32 @@ class AuthTransportMixin:
         if cached is not None:
             try:
                 return await self._request(cached)
-            except ISAPIAuthError:
-                raise
-            except ISAPIError as err:
+            except ISAPIStatusError as err:
+                # The panel answered, differently: re-discover the shape.
                 _LOGGER.debug("Эндпоинт %s перестал отвечать (%s)", cached.name, err)
                 setattr(self, slot, None)
+            # ISAPIAuthError and transport errors (panel offline) propagate
+            # untouched: the learned shape is still right, the panel is not.
 
         auth_failed = False
+        offline: ISAPIError | None = None
         response: httpx.Response | None = None
 
         async def attempt(call: Call) -> bool:
-            nonlocal auth_failed, response
+            nonlocal auth_failed, offline, response
+            if offline is not None:
+                # The panel did not answer at all: other endpoint SHAPES
+                # cannot help, so do not knock on the door three times.
+                return False
             try:
                 response = await self._request(call)
             except ISAPIAuthError:
                 auth_failed = True
+                raise
+            except ISAPIStatusError:
+                raise
+            except ISAPIError as err:
+                offline = err
                 raise
             return True
 
@@ -264,6 +296,11 @@ class AuthTransportMixin:
         if chosen is None:
             if auth_failed:
                 raise ISAPIAuthError("Панель отклонила учётные данные (401)")
+            if offline is not None:
+                # Not an answer at all (timeout, refused, reset): retryable.
+                # Concluding "unsupported" here would switch the doorbell off
+                # for good after a power blip at the gate.
+                raise ISAPIError(f"панель не отвечает: {offline}")
             raise ISAPIUnsupported(
                 "Ни один из известных эндпоинтов не ответил: "
                 + ", ".join(c.path for c in candidates)

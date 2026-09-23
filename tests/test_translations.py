@@ -94,13 +94,13 @@ class TestTranslations(unittest.TestCase):
                 services = load_json(path)["services"]
                 self.assertIn("probe", services)
                 self.assertEqual(
-                    {"entry_id", "test_door"}, set(services["probe"]["fields"])
+                    {"entry_id", "test_door", "minutes"}, set(services["probe"]["fields"])
                 )
 
     def test_service_yaml_and_translations_agree(self):
         text = (SRC / "services.yaml").read_text(encoding="utf-8")
         self.assertTrue(text.startswith("probe:"))
-        for field in ("entry_id", "test_door"):
+        for field in ("entry_id", "test_door", "minutes"):
             self.assertIn(f"{field}:", text)
 
 

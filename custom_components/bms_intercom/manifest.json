@@ -1,7 +1,7 @@
 {
   "domain": "bms_intercom",
   "name": "BMS Intercom",
-  "version": "0.2.5",
+  "version": "0.2.6",
   "config_flow": true,
   "documentation": "https://github.com/optomtr/bms-intercom",
   "issue_tracker": "https://github.com/optomtr/bms-intercom/issues",

@@ -13,6 +13,7 @@ from homeassistant.core import HomeAssistant, ServiceCall
 import homeassistant.helpers.config_validation as cv
 
 from .const import (
+    ATTR_MINUTES,
     ATTR_TEST_DOOR,
     CONF_PROXY_PORT,
     DEFAULT_PROXY_PORT,
@@ -30,7 +31,7 @@ _PROXY_KEY = f"{DOMAIN}_https_proxy"
 _FRONTEND_FLAG = f"{DOMAIN}_frontend_registered"
 _STATIC_URL = f"/{DOMAIN}_static"
 # Bump on any frontend change so browsers reload the cached module.
-_CARD_VERSION = "0.6.0"
+_CARD_VERSION = "0.6.1"
 _CARD_URL = f"{_STATIC_URL}/bms_intercom_card.js?v={_CARD_VERSION}"
 
 
@@ -62,6 +63,10 @@ _PROBE_SCHEMA = vol.Schema(
         vol.Optional("entry_id"): cv.string,
         # Off by default: a diagnostic must not unlock the entrance door.
         vol.Optional(ATTR_TEST_DOOR, default=False): cv.boolean,
+        # How far back to search the terminal's event log (AcsEvent).
+        vol.Optional(ATTR_MINUTES, default=15): vol.All(
+            vol.Coerce(int), vol.Range(min=1, max=1440)
+        ),
     }
 )
 
@@ -81,7 +86,10 @@ async def _async_register_services(hass: HomeAssistant) -> None:
         if not targets:
             _LOGGER.warning("bms_intercom.probe: нет настроенных домофонов")
         for device in targets:
-            await device.async_probe(test_door=call.data.get(ATTR_TEST_DOOR, False))
+            await device.async_probe(
+                test_door=call.data.get(ATTR_TEST_DOOR, False),
+                acs_minutes=call.data.get(ATTR_MINUTES, 15),
+            )
 
     hass.services.async_register(
         DOMAIN, SERVICE_PROBE, _handle_probe, schema=_PROBE_SCHEMA

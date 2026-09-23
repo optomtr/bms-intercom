@@ -542,6 +542,26 @@ class TestEndpointFallback(unittest.TestCase):
         self.assertEqual(len(paths), 1)
         run(client.async_close())
 
+    def test_offline_panel_is_retryable_not_unsupported(self):
+        tried = []
+
+        def handler(request):
+            tried.append(request.url.path)
+            raise httpx.ConnectError("No route to host")
+
+        client = make_client(handler)
+        with self.assertRaises(isapi.ISAPIError) as ctx:
+            run(client.async_get_call_status())
+        self.assertNotIsInstance(ctx.exception, isapi.ISAPIUnsupported)
+        self.assertEqual(len(tried), 1)          # no knocking three times
+        run(client.async_close())
+
+    def test_all_404_is_unsupported(self):
+        client = make_client(lambda request: httpx.Response(404))
+        with self.assertRaises(isapi.ISAPIUnsupported):
+            run(client.async_get_call_status())
+        run(client.async_close())
+
     def test_missing_answer_endpoint_is_tolerated(self):
         def handler(_request: httpx.Request) -> httpx.Response:
             return httpx.Response(501, text="not implemented")

@@ -7,6 +7,8 @@ Split out of isapi.py to keep both files readable (and under the project's
 from __future__ import annotations
 
 import logging
+import uuid
+from datetime import timedelta
 from typing import Any
 
 import httpx
@@ -33,13 +35,32 @@ from .endpoints import (
     stream_info_paths,
 )
 from .events import parse_document
+from .acsevent import (
+    ACS_EVENT_PATH,
+    MAX_PAGES,
+    format_section,
+    panel_now,
+    parse_page,
+    search_body,
+)
 from .probe import ProbeResult
+from .transport import ISAPIError
 
 _LOGGER = logging.getLogger(__name__)
 
 
 #: The endpoint a browser was proven to authenticate against on DS-K1T341AM.
 AUTH_CHECK_PATH = "/ISAPI/Security/userCheck"
+
+#: Read-only discovery documents: where else can a button press show up, and
+#: can the panel PUSH events to us? (name, path, how much of the body to show)
+DISCOVERY_GETS: tuple[tuple[str, str, int], ...] = (
+    ("systemTime", "/ISAPI/System/time", 300),
+    ("accessControl.capabilities", "/ISAPI/AccessControl/capabilities", 2000),
+    ("acsEvent.capabilities", "/ISAPI/AccessControl/AcsEvent/capabilities?format=json", 2000),
+    ("httpHosts", "/ISAPI/Event/notification/httpHosts", 2000),
+    ("httpHosts.capabilities", "/ISAPI/Event/notification/httpHosts/capabilities", 2000),
+)
 
 
 def _verdict(value: bool | None, yes: str, no: str) -> str:
@@ -140,7 +161,9 @@ class ProbeMixin:
             result.body = resp.text
         return result
 
-    async def async_probe(self, *, test_door: bool = False) -> tuple[list[ProbeResult], dict[str, Any]]:
+    async def async_probe(
+        self, *, test_door: bool = False, acs_minutes: int = 15
+    ) -> tuple[list[ProbeResult], dict[str, Any]]:
         """Probe every candidate endpoint and return results + a summary.
 
         The door relay is NOT triggered unless `test_door=True` — a diagnostic
@@ -208,6 +231,18 @@ class ProbeMixin:
                 if status_ok(results[-1].status):
                     break
 
+        # --- discovery: where else can "someone pressed call" be seen? ---
+        time_doc = ""
+        for name, path, limit in DISCOVERY_GETS:
+            result = await self._probe_one(name, "GET", path)
+            result.body_limit = limit
+            results.append(result)
+            if name == "systemTime" and result.ok:
+                time_doc = result.body
+        self.probe_sections, self.probe_acs_events = await self._probe_acs_events(
+            results, time_doc, acs_minutes
+        )
+
         matrix = await self.async_auth_matrix()
         working = [r for r in results if r.ok]
         summary: dict[str, Any] = {
@@ -249,6 +284,59 @@ class ProbeMixin:
         }
         return results, summary
 
+    async def _probe_acs_events(
+        self, results: list[ProbeResult], time_doc: str, minutes: int
+    ) -> tuple[list[str], list[dict[str, Any]]]:
+        """Search the terminal's event log for the last `minutes` minutes.
+
+        Read-only (a POST, but a search). Anchored to the panel's own clock
+        so a clock/zone mismatch cannot hide the button press.
+        """
+        now, clock = panel_now(time_doc)
+        window_start = (now - timedelta(minutes=minutes)).replace(microsecond=0)
+        window = (
+            f"последние {minutes} мин ({clock}): "
+            f"{window_start.isoformat()} … {now.replace(microsecond=0).isoformat()}"
+        )
+        records: list[dict[str, Any]] = []
+        status = ""
+        position = 0
+        search_id = uuid.uuid4().hex
+        for page in range(MAX_PAGES):
+            result = await self._probe_one(
+                f"acsEvent.search p{page + 1}", "POST", ACS_EVENT_PATH,
+                body=search_body(
+                    now, minutes=minutes, position=position, search_id=search_id
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            result.body_limit = 300
+            results.append(result)
+            if not result.ok:
+                status = (
+                    f"HTTP {result.status}" if result.status is not None
+                    else f"ошибка: {result.error}"
+                )
+                break
+            page_records, status, matches = parse_page(result.body)
+            records.extend(page_records)
+            position += matches
+            if status.upper() != "MORE" or matches == 0:
+                break
+        sections = format_section(
+            records, window=window, status=status, secrets=self.secrets
+        )
+        events = [
+            {
+                key: record.get(key)
+                for key in ("time", "major", "minor", "name", "cardNo",
+                            "currentVerifyMode", "employeeNoString", "doorNo")
+                if record.get(key) not in (None, "")
+            }
+            for record in sorted(records, key=lambda r: str(r.get("time", "")))
+        ]
+        return sections, events
+
     async def _probe_alert_stream(self) -> ProbeResult:
         """Open alertStream briefly and report what the first bytes look like."""
         path = alert_stream_paths()[0]
@@ -279,7 +367,7 @@ class ProbeMixin:
                     result.content_type = resp.headers.get("content-type", "")
 
                     if resp.status_code == 401:
-                        await resp.aread()
+                        # Headers carry the challenge; never wait on a 401 body.
                         result.challenge = "; ".join(
                             resp.headers.get_list("www-authenticate")
                         ) or "(заголовок не прислан)"

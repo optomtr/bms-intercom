@@ -33,6 +33,8 @@ class ProbeResult:
     sent_auth: str = ""
     #: Every auth attempt for this endpoint: (scheme, header, status).
     attempts: tuple[tuple[str, str, int], ...] = ()
+    #: Discovery documents (httpHosts, capabilities) need more than a glance.
+    body_limit: int = 120
     error: str = ""
     secrets: tuple[str | None, ...] = field(default=(), repr=False)
 
@@ -50,7 +52,7 @@ class ProbeResult:
             parts.append(self.content_type.split(";")[0])
         if self.error:
             parts.append(f"ошибка: {redact(self.error, *self.secrets)}")
-        body = snippet(self.body, secrets=self.secrets)
+        body = snippet(self.body, limit=self.body_limit, secrets=self.secrets)
         if body:
             parts.append(f"| {body}")
         line = "  ".join(parts)
@@ -71,7 +73,7 @@ class ProbeResult:
             "ok": self.ok,
             "auth": self.auth,
             "content_type": self.content_type,
-            "body": snippet(self.body, secrets=self.secrets),
+            "body": snippet(self.body, limit=self.body_limit, secrets=self.secrets),
             "challenge": self.challenge,
             "sent_auth": self.sent_auth,
             "attempts": [
@@ -87,6 +89,7 @@ def format_probe_report(
     *,
     host: str = "",
     summary: dict[str, Any] | None = None,
+    sections: list[str] | None = None,
 ) -> str:
     """Human-readable report for the HA log (and the entity attributes)."""
     lines = [f"BMS Intercom — проверка панели {host}".rstrip()]
@@ -99,6 +102,9 @@ def format_probe_report(
         lines.append(f"  {index:>2}. [{mark}] {result.name}: {result.as_line()}")
     if not results:
         lines.append("  (ни один запрос не выполнен)")
+    if sections:
+        lines.append("  " + "-" * 60)
+        lines.extend(sections)
     return "\n".join(lines)
 
 
@@ -107,9 +113,13 @@ def report_attributes(
     *,
     host: str = "",
     summary: dict[str, Any] | None = None,
+    sections: list[str] | None = None,
+    events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Attributes for the probe button entity."""
-    text = format_probe_report(results, host=host, summary=summary)
+    text = format_probe_report(
+        results, host=host, summary=summary, sections=sections
+    )
     if len(text) > REPORT_MAX_ATTR_LEN:
         text = text[:REPORT_MAX_ATTR_LEN] + "\n  … отчёт обрезан, см. журнал HA"
     attrs: dict[str, Any] = {
@@ -118,4 +128,6 @@ def report_attributes(
     }
     if summary:
         attrs["probe_summary"] = {k: v for k, v in summary.items()}
+    if events is not None:
+        attrs["probe_acs_events"] = events[:90]
     return attrs

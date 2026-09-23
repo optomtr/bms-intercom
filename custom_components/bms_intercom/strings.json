@@ -79,6 +79,10 @@
         "test_door": {
           "name": "Test the door relay",
           "description": "WARNING: really opens the door. Off by default."
+        },
+        "minutes": {
+          "name": "Event log, minutes",
+          "description": "How many recent minutes of the terminal's event log (AcsEvent) to show. 15 by default."
         }
       }
     }

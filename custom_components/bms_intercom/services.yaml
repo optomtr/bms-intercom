@@ -23,3 +23,15 @@ probe:
       default: false
       selector:
         boolean:
+    minutes:
+      name: Журнал событий, минут
+      description: >-
+        За сколько последних минут показать журнал событий терминала
+        (AcsEvent). По умолчанию 15.
+      required: false
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 1440
+          unit_of_measurement: мин

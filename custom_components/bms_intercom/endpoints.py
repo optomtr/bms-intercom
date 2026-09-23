@@ -250,6 +250,13 @@ _CRED_IN_URL = re.compile(
     r"(?i)\b([a-z][a-z0-9+.\-]*://)(?:[^/\s:@]{1,128}:[^/\s@]{1,256}@)"
 )
 _AUTH_HEADER = re.compile(r"(?i)(authorization\s*[:=]\s*)\S+")
+# httpHosts and similar documents can carry the push target's credentials.
+_XML_SECRET = re.compile(
+    r"(?is)(<(?:[\w-]+:)?(password|passwd|secretKey|key)\b[^>]*>)(.*?)(</(?:[\w-]+:)?\2\s*>)"
+)
+_JSON_SECRET = re.compile(
+    r'(?i)("(?:password|passwd|secretKey)"\s*:\s*)"(?:[^"\\]|\\.)*"'
+)
 
 
 def redact(text: str | None, *secrets: str | None) -> str:
@@ -258,6 +265,8 @@ def redact(text: str | None, *secrets: str | None) -> str:
         return ""
     out = _CRED_IN_URL.sub(r"\1***@", text)
     out = _AUTH_HEADER.sub(r"\1***", out)
+    out = _XML_SECRET.sub(lambda m: f"{m.group(1)}***{m.group(4)}", out)
+    out = _JSON_SECRET.sub(r'\1"***"', out)
     for secret in secrets:
         if secret and len(secret) >= 3:
             out = out.replace(secret, "***")

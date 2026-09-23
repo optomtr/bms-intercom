@@ -27,8 +27,13 @@ from .const import (
 )
 from .events import call_state_from_event
 from .isapi import ISAPIAuthError, ISAPIError, ISAPIUnsupported
+from .transport import describe_error
 
 _LOGGER = logging.getLogger(__name__)
+
+#: Give up on the stream for this session after this many failures in a row
+#: without it ever connecting (the poller already covers the doorbell).
+STREAM_GIVE_UP = 3
 
 #: Entry ids whose next update must NOT trigger a reload — the integration
 #: writing down what it learned about the panel is not a user change.
@@ -38,6 +43,8 @@ _SKIP_RELOAD = f"{__name__}_skip_reload"
 STATE_IDLE = "idle"
 STATE_RINGING = "ringing"
 STATE_ANSWERED = "answered"
+#: What ISAPIClient.async_get_call_status() may return besides None (unknown).
+_KNOWN_STATES = frozenset({STATE_IDLE, STATE_RINGING, STATE_ANSWERED})
 
 
 class CallSourceMixin:
@@ -57,14 +64,35 @@ class CallSourceMixin:
 
     # --- event stream ------------------------------------------------------
     async def _async_alert_loop(self) -> None:
-        """Keep the alertStream connection up, with reconnect and backoff."""
+        """Keep the alertStream connection up, with reconnect and backoff.
+
+        Until the stream has connected at least once, the callStatus poller
+        runs alongside it, so a visitor is never missed while we find out
+        what this firmware supports. Then:
+          * 404/405/… on the stream  -> unsupported, remembered in the entry,
+            polling only (never asked again after a restart);
+          * STREAM_GIVE_UP failures in a row without ever connecting -> keep
+            polling for this session (not persisted: the cause is unclear);
+          * the stream connects -> the poller is stopped.
+        """
         backoff = ALERT_BACKOFF_START
+        connected_once = False
+        failures = 0
+
+        def _connected() -> None:
+            nonlocal connected_once, failures
+            connected_once = True
+            failures = 0
+            self._set_available(True)
+            if self._unsub_poll is not None:
+                _LOGGER.info("[%s] Поток событий подключён — опрос остановлен", self.name)
+                self._unsub_poll()
+                self._unsub_poll = None
+
         while True:
             try:
                 assert self._client is not None
-                async for event in self._client.async_iter_alerts(
-                    on_connect=lambda: self._set_available(True)
-                ):
+                async for event in self._client.async_iter_alerts(on_connect=_connected):
                     backoff = ALERT_BACKOFF_START
                     state = call_state_from_event(event)
                     _LOGGER.debug(
@@ -83,18 +111,47 @@ class CallSourceMixin:
                 self._use_alert_stream = False
                 self._remember_no_alert_stream()
                 self._start_poll()
+                self._notify()
                 return
             except ISAPIAuthError as err:
-                self._set_available(False, str(err))
+                self._stream_failed(str(err))
                 backoff = ALERT_BACKOFF_MAX
             except ISAPIError as err:
-                self._set_available(False, str(err))
+                self._stream_failed(str(err))
                 backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
             except Exception as err:  # noqa: BLE001 - listener must never die
                 _LOGGER.exception("[%s] Сбой потока событий: %s", self.name, err)
-                self._set_available(False, str(err))
+                self._stream_failed(describe_error(err))
                 backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
+
+            if not connected_once:
+                failures += 1
+                if failures >= STREAM_GIVE_UP:
+                    _LOGGER.warning(
+                        "[%s] Поток событий не подключился %s раз подряд — "
+                        "до перезапуска работаем опросом callStatus",
+                        self.name, failures,
+                    )
+                    self._use_alert_stream = False
+                    self._start_poll()
+                    self._notify()
+                    return
             await asyncio.sleep(backoff)
+
+    @callback
+    def _stream_failed(self, reason: str) -> None:
+        """A stream failure. Covered by polling until the stream is proven."""
+        if self._unsub_poll is None:
+            _LOGGER.info(
+                "[%s] Поток событий недоступен (%s) — пока опрашиваем callStatus",
+                self.name, reason,
+            )
+            self._start_poll()
+            self._notify()
+            return
+        # The poller now owns panel availability; a stream hiccup must not
+        # flip the entities between "on line" and "off line" every retry.
+        _LOGGER.debug("[%s] Поток событий: %s", self.name, reason)
 
     @callback
     def _remember_no_alert_stream(self) -> None:
@@ -150,7 +207,8 @@ class CallSourceMixin:
         self._set_available(True)
         if raw is None:
             return  # unknown word from the panel: keep the state we had
-        self._apply_call_state(_ISAPI_STATUS_TO_STATE.get(raw, STATE_IDLE))
+        if raw in _KNOWN_STATES:
+            self._apply_call_state(raw)
 
     # --- call state --------------------------------------------------------
     @callback

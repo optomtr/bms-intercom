@@ -1,0 +1,66 @@
+"""The popup card must survive the states the real frontend goes through.
+
+Reported from Chrome (Android + Windows):
+    TypeError: Cannot convert undefined or null to object
+      at groupIntercoms (bms_intercom_card.js:32)  <- tick (…:256)
+`hass` exists while the frontend boots / reconnects its websocket, but
+`hass.states` does not yet. Runs tests/js/card_harness.js under node.
+
+Run: python3 -m unittest discover -s tests -v   (skipped when node is absent)
+"""
+from __future__ import annotations
+
+import json
+import shutil
+import subprocess
+import unittest
+from pathlib import Path
+
+HARNESS = Path(__file__).resolve().parent / "js" / "card_harness.js"
+NODE = shutil.which("node")
+
+
+@unittest.skipIf(NODE is None, "node not installed")
+class TestPopupCard(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        proc = subprocess.run(
+            [NODE, str(HARNESS)], capture_output=True, text=True, timeout=30
+        )
+        if proc.returncode != 0:
+            raise AssertionError(f"harness crashed: {proc.stderr[-2000:]}")
+        cls.out = json.loads(proc.stdout)
+
+    def assertSurvives(self, case):
+        result = self.out[case]
+        self.assertTrue(result["ok"], f"{case}: {result.get('error')}")
+        return result["value"]
+
+    def test_no_home_assistant_element(self):
+        self.assertSurvives("no_home_assistant")
+
+    def test_hass_without_states_does_not_throw(self):
+        """The exact crash from the field."""
+        self.assertSurvives("hass_without_states")
+        self.assertEqual(self.assertSurvives("group_without_states"), 0)
+
+    def test_states_null(self):
+        self.assertSurvives("states_null")
+
+    def test_null_entry_inside_states(self):
+        self.assertEqual(self.assertSurvives("null_entry"), 0)
+
+    def test_a_ringing_call_is_still_found(self):
+        self.assertEqual(self.assertSurvives("ringing_group"), "ringing")
+
+    def test_camera_without_token_yet(self):
+        self.assertSurvives("ringing_tick_without_camera_token")
+
+    def test_a_failing_tick_is_logged_once_not_every_400ms(self):
+        self.assertSurvives("safe_tick_swallows")
+        self.assertEqual(self.out["warnings"], 1)
+        self.assertEqual(self.out["errors"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
