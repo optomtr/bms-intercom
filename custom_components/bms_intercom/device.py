@@ -156,6 +156,9 @@ class BMSIntercomDevice:
             door_no=self._opt(CONF_DOOR_NO, DEFAULT_DOOR_NO),
             channel=self.channel,
         )
+        # Digest is proven on this hardware: never start pinned to a scheme
+        # remembered from an earlier, broken session.
+        self._client.reset_auth()
         self._use_alert_stream = bool(
             self._opt(CONF_USE_ALERT_STREAM, DEFAULT_USE_ALERT_STREAM)
         )

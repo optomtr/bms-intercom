@@ -23,6 +23,7 @@ from .endpoints import (
     channel_order,
     door_calls,
     identity_calls,
+    redact,
     rtsp_paths,
     rtsp_url,
     snapshot_paths,
@@ -197,37 +198,54 @@ class ProbeMixin:
             name="alertStream", method="GET", url=f"{self._base}{path}",
             secrets=self.secrets,
         )
-        headers: dict[str, str] = {}
-        sent = self._authorization("GET", path)
-        if sent:
-            headers["Authorization"] = sent
         try:
-            async with self._client.stream(
-                "GET", f"{self._base}{path}",
-                headers=headers,
-                timeout=httpx.Timeout(10.0, read=8.0),
-            ) as resp:
-                result.status = resp.status_code
-                result.auth = self.auth_mode
-                result.sent_auth = safe_auth_header(sent)
-                if resp.status_code == 401:
-                    await resp.aread()
-                    result.challenge = "; ".join(
-                        resp.headers.get_list("www-authenticate")
-                    ) or "(заголовок не прислан)"
-                result.content_type = resp.headers.get("content-type", "")
-                if status_ok(resp.status_code):
+            # Attempt 0 may come back 401; attempt 1 answers that challenge.
+            for attempt in (0, 1):
+                sent = self._stream_authorization("GET", path, attempt)
+                headers = {"Authorization": sent} if sent else {}
+                async with self._client.stream(
+                    "GET", f"{self._base}{path}",
+                    headers=headers,
+                    timeout=httpx.Timeout(10.0, read=8.0),
+                ) as resp:
+                    result.status = resp.status_code
+                    result.auth = self.auth_mode
+                    result.sent_auth = safe_auth_header(sent)
+                    result.attempts += (
+                        (
+                            (sent or "").split(" ", 1)[0].lower() or "без заголовка",
+                            safe_auth_header(sent),
+                            resp.status_code,
+                        ),
+                    )
+                    result.content_type = resp.headers.get("content-type", "")
+
+                    if resp.status_code == 401:
+                        await resp.aread()
+                        result.challenge = "; ".join(
+                            resp.headers.get_list("www-authenticate")
+                        ) or "(заголовок не прислан)"
+                        if attempt == 0 and self._learn_challenge(resp):
+                            continue
+                        result.body = ""
+                        return result
+
+                    if not status_ok(resp.status_code):
+                        result.body = ""
+                        return result
+
                     try:
                         async for chunk in resp.aiter_bytes():
-                            result.body = snippet(chunk, limit=400, secrets=self.secrets)
+                            result.body = snippet(
+                                chunk, limit=400, secrets=self.secrets
+                            )
                             if result.body:
                                 break
                     except httpx.ReadTimeout:
                         result.body = "(подключение живо, событий пока нет)"
                     if not result.body:
                         result.body = "(подключение живо, событий пока нет)"
-                else:
-                    result.body = ""
+                    return result
         except httpx.HTTPError as err:
             result.error = redact(str(err), *self.secrets)
         return result

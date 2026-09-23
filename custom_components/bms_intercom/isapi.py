@@ -91,6 +91,7 @@ class ISAPIClient(ProbeMixin):
         door_no: int = 1,
         channel: int = DEFAULT_CHANNEL,
         timeout: float = 10.0,
+        reuse_nonce: bool = False,
     ) -> None:
         self._host = host
         self._username = username
@@ -107,6 +108,14 @@ class ISAPIClient(ProbeMixin):
         # http1 only, no redirects and no environment proxy in between.
         self._challenge: Challenge | None = None
         self._nc = 0
+        # DS-K1T341AM V3.2.30 issues ONE-SHOT nonces: a request built on a
+        # nonce that was already used comes back 401 (often without
+        # stale=true). So by default every request takes its own challenge —
+        # go out unauthenticated, answer the 401 that comes back with nc=1 and
+        # a fresh cnonce. `reuse_nonce=True` turns the one-round-trip fast
+        # path back on for firmwares that tolerate it; it falls back to a
+        # fresh challenge the moment a 401 arrives.
+        self._reuse_nonce = reuse_nonce
         # Diagnostics (no secrets): what the panel asked for and what we sent.
         self.first_challenge_raw: str = ""
         self.last_challenge_raw: str = ""
@@ -147,16 +156,51 @@ class ISAPIClient(ProbeMixin):
         await self._client.aclose()
 
     def _authorization(self, method: str, target: str) -> str | None:
-        """Header to send up front with the scheme we already know works."""
+        """Header to send up front, or None to ask for a fresh challenge."""
         if self.auth_mode == AUTH_BASIC:
             return basic_authorization(self._username, self._password)
-        if self._challenge is not None:
+        if self._reuse_nonce and self._challenge is not None:
             self._nc += 1
             return build_authorization(
                 self._username, self._password, method, target,
                 self._challenge, nc=self._nc,
             )
+        # Challenge-per-request: correctness before the saved round trip.
         return None
+
+    def _fresh_digest_header(self, method: str, target: str) -> str | None:
+        """Answer the challenge we just learned, with nc=1 and a new cnonce."""
+        if self._challenge is None:
+            return None
+        self._nc = 1
+        return build_authorization(
+            self._username, self._password, method, target, self._challenge, nc=1
+        )
+
+    def _stream_authorization(
+        self, method: str, path: str, attempt: int = 0
+    ) -> str | None:
+        """Auth header for a streaming request.
+
+        Attempt 0 follows the normal policy (nothing, unless basic or the
+        opt-in reuse path). Attempt 1 answers the challenge that attempt 0
+        just brought back — never an older, already spent one.
+        """
+        if attempt == 0:
+            return self._authorization(method, path)
+        return self._fresh_digest_header(method, path)
+
+    def reset_auth(self) -> None:
+        """Forget a remembered scheme/nonce and start from digest again.
+
+        A `basic` learned during a broken session must never pin the client:
+        digest is proven to work on this hardware.
+        """
+        self.auth_mode = AUTH_DIGEST
+        self._challenge = None
+        self._nc = 0
+        self._auth_proven = False
+        self._basic_rescue_tried = False
 
     async def _raw(
         self, method: str, url: str, body: str | None, headers: dict[str, str]
@@ -216,6 +260,11 @@ class ISAPIClient(ProbeMixin):
         if not self.first_challenge_raw:
             self.first_challenge_raw = self.last_challenge_raw
         challenge = pick_digest_challenge(challenges)
+        if challenge is None and self._challenge is not None:
+            # 401 without a challenge after we sent a reused nonce: the panel
+            # threw the nonce away. Drop it so the next request asks anew.
+            _LOGGER.debug("401 без вызова на %s — забываем nonce", path)
+            self._challenge = None
 
         if challenge is not None:
             # Fresh nonce from this very 401, answered immediately so the
@@ -231,9 +280,12 @@ class ISAPIClient(ProbeMixin):
             self._record_attempt(sent, resp.status_code)
             if status_ok(resp.status_code):
                 if self.auth_mode != AUTH_DIGEST:
-                    _LOGGER.info("Панель приняла digest-авторизацию, запоминаем")
+                    _LOGGER.info(
+                        "Панель приняла digest-авторизацию — возвращаемся на digest"
+                    )
                 self.auth_mode = AUTH_DIGEST
                 self._auth_proven = True
+                self._basic_rescue_tried = False
                 return resp
             if resp.status_code == 401:
                 more = list(resp.headers.get_list("www-authenticate"))
@@ -442,7 +494,7 @@ class ISAPIClient(ProbeMixin):
         # First attempt with what we know, second answering the 401 challenge.
         for attempt in (0, 1):
             headers: dict[str, str] = {}
-            sent = self._authorization("GET", path)
+            sent = self._stream_authorization("GET", path, attempt)
             if sent:
                 headers["Authorization"] = sent
             try:

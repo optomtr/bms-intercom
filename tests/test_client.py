@@ -107,14 +107,34 @@ class TestRealDigest(unittest.TestCase):
         self.assertEqual(panel.challenges_sent, 1)     # exactly one 401
         run(client.async_close())
 
-    def test_next_request_reuses_the_challenge_with_nc_incremented(self):
+    def test_every_request_takes_its_own_challenge_by_default(self):
+        """DS-K1T341AM nonces are one-shot: never carry one over."""
         panel = FakeDigestPanel()
         client = make_client(panel)
         run(client.async_verify())
         panel.seen.clear()
         run(client.async_get_call_status())
+        self.assertEqual(panel.seen[0], "")            # asks for a fresh nonce
+        self.assertIn("nc=00000001", panel.seen[1])    # answers with nc=1
+        run(client.async_close())
+
+    def test_nonce_reuse_is_available_as_an_opt_in_fast_path(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel, reuse_nonce=True)
+        run(client.async_verify())
+        panel.seen.clear()
+        run(client.async_get_call_status())
         self.assertTrue(panel.seen[0].startswith("Digest "))
         self.assertIn("nc=00000002", panel.seen[0])    # no second 401 needed
+        run(client.async_close())
+
+    def test_cnonce_is_fresh_for_every_challenge(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        run(client.async_verify())
+        run(client.async_get_call_status())
+        cnonces = re.findall(r'cnonce="([^"]+)"', " ".join(panel.seen))
+        self.assertEqual(len(cnonces), len(set(cnonces)))
         run(client.async_close())
 
     def test_query_string_is_part_of_the_signed_uri(self):
@@ -327,6 +347,176 @@ class TestAuth(unittest.TestCase):
         client = make_client(handler)
         with self.assertRaises(isapi.ISAPIAuthError):
             run(client.async_verify())
+        run(client.async_close())
+
+
+class OneShotNoncePanel(FakeDigestPanel):
+    """Hikvision V3.x behaviour: a nonce is accepted exactly once.
+
+    A request built on an already-spent nonce comes back 401 with a brand-new
+    nonce and no `stale=true` — indistinguishable from a wrong password unless
+    the client simply takes the new challenge and answers it.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.spent: set[str] = set()
+        self.issued = 0
+        self.rejected_reuse = 0
+
+    def _unauthorized(self):
+        self.issued += 1
+        self.nonce = f"nonce-{self.issued:04d}"
+        return super()._unauthorized()
+
+    def __call__(self, request):
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("digest "):
+            used = re.search(r'nonce="([^"]*)"', auth)
+            nonce = used.group(1) if used else ""
+            if nonce in self.spent:
+                self.rejected_reuse += 1
+                self.seen.append(auth)
+                return self._unauthorized()     # new nonce, no stale flag
+            current = self.nonce
+            self.nonce = nonce                  # verify against what was used
+            try:
+                response = super().__call__(request)
+            finally:
+                self.nonce = current
+            if response.status_code == 200:
+                self.spent.add(nonce)
+            return response
+        return super().__call__(request)
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class TestOneShotNonce(unittest.TestCase):
+    """The real failure mode: digest → 200 once, then 401 on everything."""
+
+    def test_catalogue_walk_succeeds_against_one_shot_nonces(self):
+        panel = OneShotNoncePanel()
+        client = make_client(panel)
+        run(client.async_verify())
+        run(client.async_get_call_status())
+        run(client.async_open_door())
+        self.assertEqual(client.auth_mode, "digest")
+        self.assertEqual(panel.rejected_reuse, 0)   # we never reuse a nonce
+        self.assertGreaterEqual(len(panel.spent), 3)
+        run(client.async_close())
+
+    def test_probe_reports_working_endpoints_not_a_wall_of_401(self):
+        panel = OneShotNoncePanel()
+        client = make_client(panel)
+        results, summary = run(client.async_probe())
+        self.assertTrue(all(r.ok for r in results if r.name == "userCheck"))
+        self.assertNotIn("0 из", str(summary["успешно"]))
+        self.assertIn("digest → 200", str(summary["проверка /ISAPI/Security/userCheck"]))
+        run(client.async_close())
+
+    def test_the_reuse_fast_path_recovers_instead_of_failing(self):
+        """Even opted in, a rejected nonce must not break the request."""
+        panel = OneShotNoncePanel()
+        client = make_client(panel, reuse_nonce=True)
+        run(client.async_verify())
+        run(client.async_get_call_status())     # first reuse gets rejected
+        self.assertGreaterEqual(panel.rejected_reuse, 1)
+        self.assertEqual(client.auth_mode, "digest")
+        run(client.async_close())
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class TestAlertStreamAuth(unittest.TestCase):
+    """The event stream must answer its 401 too, not give up on it."""
+
+    def _panel(self):
+        panel = OneShotNoncePanel()
+        events = (
+            "--MIME_boundary\r\nContent-Type: application/xml\r\n\r\n"
+            "<EventNotificationAlert><eventType>videoIntercom</eventType>"
+            "<eventState>active</eventState><status>ring</status>"
+            "</EventNotificationAlert>\r\n"
+        )
+
+        def handler(request):
+            response = panel(request)
+            if response.status_code == 200 and "alertStream" in str(request.url):
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "multipart/mixed; boundary=MIME_boundary"},
+                    text=events,
+                )
+            return response
+
+        return panel, handler
+
+    def test_stream_authenticates_and_yields_events(self):
+        _panel, handler = self._panel()
+        client = make_client(handler)
+
+        async def collect():
+            got = []
+            async for event in client.async_iter_alerts():
+                got.append(event)
+            return got
+
+        events_got = run(collect())
+        self.assertEqual(len(events_got), 1)
+        self.assertEqual(events_got[0]["type"], "videointercom")
+        run(client.async_close())
+
+    def test_the_stream_never_sends_a_spent_nonce(self):
+        panel, handler = self._panel()
+        client = make_client(handler)
+        run(client.async_verify())          # consumes a nonce
+
+        async def collect():
+            async for _event in client.async_iter_alerts():
+                pass
+
+        run(collect())
+        self.assertEqual(panel.rejected_reuse, 0)
+        run(client.async_close())
+
+    def test_whole_probe_wastes_no_round_trip_on_a_spent_nonce(self):
+        panel, handler = self._panel()
+        client = make_client(handler)
+        run(client.async_probe())
+        self.assertEqual(panel.rejected_reuse, 0)
+        run(client.async_close())
+
+    def test_probe_of_the_stream_reports_200_not_401(self):
+        _panel, handler = self._panel()
+        client = make_client(handler)
+        results, _summary = run(client.async_probe())
+        stream = [r for r in results if r.name == "alertStream"][0]
+        self.assertEqual(stream.status, 200)
+        self.assertTrue(any(
+            scheme == "digest" and status == 200
+            for scheme, _h, status in stream.attempts
+        ))
+        run(client.async_close())
+
+
+@unittest.skipIf(httpx is None, "httpx not installed")
+class TestAuthModeReset(unittest.TestCase):
+    def test_reset_auth_clears_a_remembered_basic(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        client.auth_mode = "basic"
+        client._basic_rescue_tried = True
+        client.reset_auth()
+        self.assertEqual(client.auth_mode, "digest")
+        self.assertIsNone(client._challenge)
+        self.assertFalse(client._basic_rescue_tried)
+        run(client.async_close())
+
+    def test_a_digest_success_snaps_back_from_basic(self):
+        panel = FakeDigestPanel()
+        client = make_client(panel)
+        client.auth_mode = "basic"      # stale memory of a broken session
+        run(client.async_verify())
+        self.assertEqual(client.auth_mode, "digest")
         run(client.async_close())
 
 
