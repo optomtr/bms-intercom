@@ -11,6 +11,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .const import (
+    CONF_ALERT_STREAM_SUPPORTED,
     CONF_CALL_TIMEOUT,
     CONF_CHANNEL,
     CONF_DOOR_NO,
