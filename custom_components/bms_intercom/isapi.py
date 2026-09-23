@@ -24,7 +24,6 @@ from .endpoints import (
     alert_stream_paths,
     call_signal_calls,
     call_status_calls,
-    channel_order,
     door_calls,
     identity_calls,
     next_auth_mode,
@@ -33,7 +32,6 @@ from .endpoints import (
     rtsp_url,
     select_first_working,
     snapshot_paths,
-    snippet,
     status_missing,
     status_ok,
     stream_info_paths,
@@ -54,7 +52,7 @@ from .events import (
     call_state_from_event,
     parse_document,
 )
-from .probe import ProbeResult
+from .probing import ProbeMixin
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -79,7 +77,7 @@ class ISAPIUnsupported(ISAPIError):
     """The panel does not have this endpoint at all (404/405/501/…)."""
 
 
-class ISAPIClient:
+class ISAPIClient(ProbeMixin):
     """Async wrapper around whatever ISAPI dialect the panel speaks."""
 
     def __init__(
@@ -448,149 +446,3 @@ class ISAPIClient:
                     f"alertStream: {redact(str(err), *self.secrets)}"
                 ) from err
         raise ISAPIAuthError("alertStream: 401 Unauthorized")
-
-    # --- diagnostics -------------------------------------------------------
-    async def _probe_one(
-        self, name: str, method: str, path: str, *, body: str | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> ProbeResult:
-        result = ProbeResult(
-            name=name, method=method, url=f"{self._base}{path}", secrets=self.secrets
-        )
-        try:
-            resp = await self._send(method, path, body=body, headers=headers)
-        except ISAPIError as err:
-            result.error = str(err)
-            return result
-        result.status = resp.status_code
-        result.auth = self.auth_mode
-        result.sent_auth = self.last_auth_header
-        if resp.status_code == 401:
-            result.challenge = self.last_challenge_raw
-        result.content_type = resp.headers.get("content-type", "")
-        if result.content_type.startswith(("image/", "video/", "application/octet")):
-            result.body = f"[{len(resp.content)} байт двоичных данных]"
-        else:
-            result.body = resp.text
-        return result
-
-    async def async_probe(self, *, test_door: bool = False) -> tuple[list[ProbeResult], dict[str, Any]]:
-        """Probe every candidate endpoint and return results + a summary.
-
-        The door relay is NOT triggered unless `test_door=True` — a diagnostic
-        must not unlock the entrance.
-        """
-        results: list[ProbeResult] = []
-
-        for call in identity_calls():
-            results.append(await self._probe_one(call.name, call.method, call.path))
-        for path in stream_info_paths(self._channel):
-            channel = path.rsplit("/", 1)[-1]
-            results.append(await self._probe_one(f"channel {channel}", "GET", path))
-            # First channel the panel confirms is the one the RTSP URL uses.
-            if results[-1].ok and self._rtsp_path is None:
-                self._rtsp_path = f"/Streaming/Channels/{channel}"
-        for path in snapshot_paths(self._channel)[:4]:
-            results.append(await self._probe_one("snapshot", "GET", path))
-        for call in call_status_calls():
-            results.append(await self._probe_one(call.name, call.method, call.path))
-        results.append(
-            await self._probe_one(
-                "videoIntercom.capabilities", "GET",
-                "/ISAPI/VideoIntercom/capabilities?format=json",
-            )
-        )
-        results.append(
-            await self._probe_one(
-                "door.capabilities", "GET",
-                f"/ISAPI/AccessControl/RemoteControl/door/{self._door_no}/capabilities?format=json",
-            )
-        )
-        results.append(await self._probe_alert_stream())
-        if test_door:
-            for call in door_calls(self._door_no):
-                results.append(
-                    await self._probe_one(
-                        call.name, call.method, call.path,
-                        body=call.body, headers=call.headers or None,
-                    )
-                )
-                if status_ok(results[-1].status):
-                    break
-
-        working = [r for r in results if r.ok]
-        summary: dict[str, Any] = {
-            "модель": self._device_model(results),
-            "WWW-Authenticate (первый 401)": self.first_challenge_raw or "(401 не было)",
-            "разбор вызова": (
-                self._challenge.describe() if self._challenge else "(digest не предложен)"
-            ),
-            "Authorization (последний отправленный)": (
-                self.last_auth_header or "(не отправляли)"
-            ),
-            "авторизация": (
-                f"{self.auth_mode} (успешно)" if working else f"{self.auth_mode} (ни один запрос не прошёл)"
-            ),
-            "RTSP": rtsp_url(
-                self._host, self._rtsp_port, self._username, self._password,
-                self._rtsp_path or rtsp_paths(self._channel)[0], redacted=True,
-            ),
-            "каналы (порядок проверки)": ", ".join(str(c) for c in channel_order(self._channel)),
-            "успешно": f"{len(working)} из {len(results)}",
-            "реле двери": "проверено командой открытия" if test_door else "не трогали (test_door=false)",
-        }
-        return results, summary
-
-    async def _probe_alert_stream(self) -> ProbeResult:
-        """Open alertStream briefly and report what the first bytes look like."""
-        path = alert_stream_paths()[0]
-        result = ProbeResult(
-            name="alertStream", method="GET", url=f"{self._base}{path}",
-            secrets=self.secrets,
-        )
-        headers: dict[str, str] = {}
-        sent = self._authorization("GET", path)
-        if sent:
-            headers["Authorization"] = sent
-        try:
-            async with self._client.stream(
-                "GET", f"{self._base}{path}",
-                headers=headers,
-                timeout=httpx.Timeout(10.0, read=8.0),
-            ) as resp:
-                result.status = resp.status_code
-                result.auth = self.auth_mode
-                result.sent_auth = safe_auth_header(sent)
-                if resp.status_code == 401:
-                    await resp.aread()
-                    result.challenge = "; ".join(
-                        resp.headers.get_list("www-authenticate")
-                    ) or "(заголовок не прислан)"
-                result.content_type = resp.headers.get("content-type", "")
-                if status_ok(resp.status_code):
-                    try:
-                        async for chunk in resp.aiter_bytes():
-                            result.body = snippet(chunk, limit=400, secrets=self.secrets)
-                            if result.body:
-                                break
-                    except httpx.ReadTimeout:
-                        result.body = "(подключение живо, событий пока нет)"
-                    if not result.body:
-                        result.body = "(подключение живо, событий пока нет)"
-                else:
-                    result.body = ""
-        except httpx.HTTPError as err:
-            result.error = redact(str(err), *self.secrets)
-        return result
-
-    @staticmethod
-    def _device_model(results: list[ProbeResult]) -> str:
-        for result in results:
-            if result.ok and "deviceInfo" in result.name:
-                event = parse_document(result.body) or {}
-                fields = event.get("fields", {})
-                model = fields.get("model", "")
-                firmware = fields.get("firmwareversion", "")
-                if model:
-                    return f"{model} {firmware}".strip()
-        return "не определена"
