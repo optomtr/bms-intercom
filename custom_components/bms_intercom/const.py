@@ -16,6 +16,9 @@ CONF_CHANNEL = "channel"
 CONF_USE_ALERT_STREAM = "use_alert_stream"
 # Seconds after which an unfinished call falls back to "idle".
 CONF_CALL_TIMEOUT = "call_timeout"
+# Learned at runtime: this firmware answered 404 on the event stream, so the
+# integration stops asking for it on every restart.
+CONF_ALERT_STREAM_SUPPORTED = "alert_stream_supported"
 
 # Option: HTTPS address of Home Assistant (e.g. https://10.10.10.10:8443) where
 # the browser microphone is allowed (secure context). The popup routes the
@@ -41,8 +44,11 @@ DEFAULT_USE_ALERT_STREAM = True
 DEFAULT_CALL_TIMEOUT = 60
 
 # How often (seconds) to poll the panel for call status when the event stream
-# is off (or the model has no alertStream).
-CALL_POLL_INTERVAL = 1.5
+# is off (or the model has no alertStream). DS-K1T341AM has no alertStream at
+# all, so this poll IS the doorbell: 1 s is the slowest a visitor tolerates.
+CALL_POLL_INTERVAL = 1.0
+# After a failed poll, wait this long before trying again (panel down / busy).
+CALL_POLL_ERROR_BACKOFF = 10.0
 
 # Reconnect backoff for the alertStream connection.
 ALERT_BACKOFF_START = 2

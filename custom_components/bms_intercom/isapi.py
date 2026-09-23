@@ -23,6 +23,7 @@ from .endpoints import (
     alert_stream_paths,
     call_signal_calls,
     call_status_calls,
+    capability_calls,
     door_calls,
     identity_calls,
     redact,
@@ -132,6 +133,13 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         self._door_call: Call | None = None
         self._status_call: Call | None = None
         self._signal_calls: dict[str, Call | None] = {}
+        self._capability_call: Call | None = None
+        #: None = not established yet, False = this firmware does not have it.
+        self.snapshot_supported: bool | None = None
+        self.call_signal_supported: bool | None = None
+        self.alert_stream_supported: bool | None = None
+        self.capabilities_raw: str = ""
+        self._unknown_status_logged: set[str] = set()
 
     # --- capabilities ------------------------------------------------------
     async def async_verify(self) -> str:
@@ -169,7 +177,15 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         )
 
     async def async_snapshot(self) -> bytes | None:
-        """Still image from the panel, or None if no shape works."""
+        """Still image from the panel, or None if this model has none.
+
+        DS-K1T341AM V3.2.30 answers 404 on every picture endpoint. After the
+        first full walk we remember that and stop asking — the camera then
+        takes its stills from the RTSP stream instead.
+        """
+        if self.snapshot_supported is False:
+            return None
+
         async def attempt(path: str) -> bool:
             resp = await self._send("GET", path)
             if not status_ok(resp.status_code) or not resp.content:
@@ -185,30 +201,79 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         chosen = await select_first_working(candidates, attempt)
         if chosen is None:
             self._snapshot_path = None
+            if self.snapshot_supported is None:
+                _LOGGER.info(
+                    "Панель не отдаёт снимок по ISAPI — кадры будем брать из потока"
+                )
+            self.snapshot_supported = False
             return None
         self._snapshot_path = chosen
+        self.snapshot_supported = True
         return self._last_snapshot
 
     _last_snapshot: bytes | None = None
 
-    async def async_get_call_status(self) -> str:
-        """Poll fallback: one of idle / ringing / answered."""
+    async def async_get_call_status(self) -> str | None:
+        """Poll the call status.
+
+        Returns idle / ringing / answered, or **None** when the panel sent a
+        word we do not know — the caller then keeps the state it had rather
+        than pretending the call ended. The real shape on DS-K1T341AM is
+        `{"CallStatus": {"status": "idle"}}`.
+        """
         resp = await self._call_selected(call_status_calls(), "_status_call")
         event = parse_document(resp.text) or {}
         # The poll answer is a status document, not an alert; force the
         # call-event reading so the shared word map applies.
         event.setdefault("fields", {})
         event["type"] = event.get("type") or "callstatus"
-        return call_state_from_event(event) or STATE_IDLE
+        state = call_state_from_event(event)
+        if state is None:
+            raw = event.get("fields", {}).get("status", "")
+            if raw not in self._unknown_status_logged:
+                self._unknown_status_logged.add(raw)
+                _LOGGER.warning(
+                    "Неизвестный статус вызова от панели: %r (оставляем прежнее "
+                    "состояние). Сообщите это значение разработчику.", raw,
+                )
+        return state
+
+    async def async_load_capabilities(self) -> bool:
+        """Read VideoIntercom/capabilities and see if answer/reject exist.
+
+        DS-K1T341AM publishes the document but has no callSignal endpoint, so
+        the buttons must degrade to local-only instead of erroring.
+        """
+        if self.call_signal_supported is not None:
+            return self.call_signal_supported
+        try:
+            resp = await self._call_selected(capability_calls(), "_capability_call")
+        except ISAPIError as err:
+            _LOGGER.debug("Возможности домофона не прочитаны: %s", err)
+            return False
+        self.capabilities_raw = resp.text
+        body = resp.text.lower()
+        self.call_signal_supported = "callsignal" in body or "cmdtype" in body
+        _LOGGER.info(
+            "Панель %s команды ответа/сброса (по capabilities)",
+            "поддерживает" if self.call_signal_supported else "не поддерживает",
+        )
+        return self.call_signal_supported
 
     async def async_answer(self) -> bool:
-        return await self._async_signal("answer")
+        return await self.async_signal("answer")
 
     async def async_reject(self) -> bool:
-        return await self._async_signal("reject")
+        return await self.async_signal("reject")
+
+    async def async_signal(self, cmd: str) -> bool:
+        """Send `answer`/`reject`; False when the model has no such command."""
+        return await self._async_signal(cmd)
 
     async def _async_signal(self, cmd: str) -> bool:
         """Answer/reject where supported. Returns False when the model has none."""
+        if self.call_signal_supported is False:
+            return False
         if cmd in self._signal_calls and self._signal_calls[cmd] is None:
             return False
         cached = self._signal_calls.get(cmd)
@@ -226,8 +291,10 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         chosen = await select_first_working(candidates, attempt)
         self._signal_calls[cmd] = chosen
         if chosen is not None:
+            self.call_signal_supported = True
             return True
         if tolerate(last_status):
+            self.call_signal_supported = False
             _LOGGER.info(
                 "Панель не поддерживает «%s» (HTTP %s) — команда пропущена",
                 cmd, last_status,
@@ -264,6 +331,7 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
                             raise ISAPIAuthError("alertStream: 401 Unauthorized")
                         continue  # retry with the fresh challenge
                     if status_missing(resp.status_code):
+                        self.alert_stream_supported = False
                         raise ISAPIUnsupported(
                             f"alertStream: HTTP {resp.status_code} — модель не умеет поток событий"
                         )
@@ -272,6 +340,7 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
                     _LOGGER.debug(
                         "alertStream подключён (auth=%s)", self.auth_mode
                     )
+                    self.alert_stream_supported = True
                     if on_connect is not None:
                         on_connect()
                     async for chunk in resp.aiter_bytes():

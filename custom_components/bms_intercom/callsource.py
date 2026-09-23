@@ -1,0 +1,196 @@
+"""Where the call state comes from: the event stream, or polling.
+
+Split out of device.py to keep both readable (and under the project's
+500-line rule). `CallSourceMixin` owns the alertStream listener, the
+callStatus poller and the call-state machine; BMSIntercomDevice owns the
+config, the actions and the diagnostics.
+
+DS-K1T341AM V3.2.30 has no alertStream at all (404), so on that hardware the
+poller IS the doorbell and runs every second.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import timedelta
+
+from homeassistant.core import callback
+from homeassistant.helpers.event import async_call_later, async_track_time_interval
+
+from .const import (
+    ALERT_BACKOFF_MAX,
+    ALERT_BACKOFF_START,
+    CALL_POLL_ERROR_BACKOFF,
+    CALL_POLL_INTERVAL,
+    CONF_ALERT_STREAM_SUPPORTED,
+)
+from .events import call_state_from_event
+from .isapi import ISAPIAuthError, ISAPIError, ISAPIUnsupported
+
+_LOGGER = logging.getLogger(__name__)
+
+#: Entry ids whose next update must NOT trigger a reload — the integration
+#: writing down what it learned about the panel is not a user change.
+_SKIP_RELOAD = f"{__name__}_skip_reload"
+
+# Call states
+STATE_IDLE = "idle"
+STATE_RINGING = "ringing"
+STATE_ANSWERED = "answered"
+
+
+class CallSourceMixin:
+    """Event stream / polling half of BMSIntercomDevice."""
+
+    def _start_alert_stream(self) -> None:
+        if self._alert_task is None or self._alert_task.done():
+            self._alert_task = self.entry.async_create_background_task(
+                self.hass, self._async_alert_loop(), f"{self.name} alertStream"
+            )
+
+    def _start_poll(self) -> None:
+        if self._unsub_poll is None:
+            self._unsub_poll = async_track_time_interval(
+                self.hass, self._async_poll, timedelta(seconds=CALL_POLL_INTERVAL)
+            )
+
+    # --- event stream ------------------------------------------------------
+    async def _async_alert_loop(self) -> None:
+        """Keep the alertStream connection up, with reconnect and backoff."""
+        backoff = ALERT_BACKOFF_START
+        while True:
+            try:
+                assert self._client is not None
+                async for event in self._client.async_iter_alerts(
+                    on_connect=lambda: self._set_available(True)
+                ):
+                    backoff = ALERT_BACKOFF_START
+                    state = call_state_from_event(event)
+                    _LOGGER.debug(
+                        "[%s] Событие панели: type=%s state=%s -> %s",
+                        self.name, event.get("type"), event.get("state"), state,
+                    )
+                    if state is not None:
+                        self._apply_call_state(state)
+                _LOGGER.debug("[%s] Поток событий закрыт панелью", self.name)
+            except asyncio.CancelledError:
+                raise
+            except ISAPIUnsupported as err:
+                _LOGGER.warning(
+                    "[%s] %s. Переходим на опрос статуса вызова.", self.name, err
+                )
+                self._use_alert_stream = False
+                self._remember_no_alert_stream()
+                self._start_poll()
+                return
+            except ISAPIAuthError as err:
+                self._set_available(False, str(err))
+                backoff = ALERT_BACKOFF_MAX
+            except ISAPIError as err:
+                self._set_available(False, str(err))
+                backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
+            except Exception as err:  # noqa: BLE001 - listener must never die
+                _LOGGER.exception("[%s] Сбой потока событий: %s", self.name, err)
+                self._set_available(False, str(err))
+                backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
+            await asyncio.sleep(backoff)
+
+    @callback
+    def _remember_no_alert_stream(self) -> None:
+        """Persist the 404 verdict so restarts do not re-discover it.
+
+        Written into the entry data, not the options, and the reload listener
+        is told to ignore this particular change — otherwise the integration
+        would restart itself the moment it learns something about itself.
+        """
+        if self.entry.data.get(CONF_ALERT_STREAM_SUPPORTED) is False:
+            return
+        skip: set[str] = self.hass.data.setdefault(_SKIP_RELOAD, set())
+        skip.add(self.entry.entry_id)
+        self.hass.config_entries.async_update_entry(
+            self.entry,
+            data={**self.entry.data, CONF_ALERT_STREAM_SUPPORTED: False},
+        )
+        _LOGGER.info(
+            "[%s] Запомнили: у модели нет потока событий, работаем опросом",
+            self.name,
+        )
+
+    # --- polling -----------------------------------------------------------
+    async def _async_poll(self, now) -> None:
+        """Poll fallback: read the panel's call status and reflect it locally.
+
+        On this hardware the poll IS the doorbell (no event stream), so it
+        runs every second — but a panel that errors gets a breather instead of
+        a request per second.
+        """
+        if self._client is None:
+            return
+        if now is not None and time.monotonic() < self._poll_blocked_until:
+            return
+        try:
+            raw = await self._client.async_get_call_status()
+        except ISAPIUnsupported as err:
+            # Nothing to poll on this model: stop hammering it every 1.5 s.
+            _LOGGER.warning(
+                "[%s] Опрос статуса вызова недоступен (%s). Состояние вызова "
+                "будет только по потоку событий.", self.name, err,
+            )
+            if self._unsub_poll is not None:
+                self._unsub_poll()
+                self._unsub_poll = None
+            return
+        except ISAPIError as err:
+            self._poll_blocked_until = time.monotonic() + CALL_POLL_ERROR_BACKOFF
+            self._set_available(False, str(err))
+            return
+
+        self._poll_blocked_until = 0.0
+        self._set_available(True)
+        if raw is None:
+            return  # unknown word from the panel: keep the state we had
+        self._apply_call_state(_ISAPI_STATUS_TO_STATE.get(raw, STATE_IDLE))
+
+    # --- call state --------------------------------------------------------
+    @callback
+    def _apply_call_state(self, new_state: str) -> None:
+        if new_state == self.call_state:
+            if new_state != STATE_IDLE:
+                self._arm_call_timeout()  # keep the safety net fresh
+            return
+        _LOGGER.debug(
+            "[%s] Статус вызова: %s -> %s", self.name, self.call_state, new_state
+        )
+        self.call_state = new_state
+        if new_state == STATE_IDLE:
+            self._cancel_call_timeout()
+        else:
+            self._arm_call_timeout()
+        self._notify()
+
+    @callback
+    def _arm_call_timeout(self) -> None:
+        """A call that never gets an end event must not hang forever."""
+        self._cancel_call_timeout()
+        timeout = self.call_timeout
+        if timeout <= 0:
+            return
+
+        @callback
+        def _expire(_now) -> None:
+            self._unsub_call_timeout = None
+            if self.call_state != STATE_IDLE:
+                _LOGGER.info(
+                    "[%s] Вызов сброшен по таймауту (%s с)", self.name, timeout
+                )
+                self.call_state = STATE_IDLE
+                self._notify()
+
+        self._unsub_call_timeout = async_call_later(self.hass, timeout, _expire)
+
+    @callback
+    def _cancel_call_timeout(self) -> None:
+        if self._unsub_call_timeout is not None:
+            self._unsub_call_timeout()
+            self._unsub_call_timeout = None

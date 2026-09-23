@@ -3,19 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_call_later, async_track_time_interval
 
 from .const import (
-    ALERT_BACKOFF_MAX,
-    ALERT_BACKOFF_START,
-    CALL_POLL_INTERVAL,
     CONF_CALL_TIMEOUT,
     CONF_CHANNEL,
     CONF_DOOR_NO,
@@ -36,23 +31,16 @@ from .const import (
     MODE_DEMO,
     SIGNAL_STATE_UPDATED,
 )
-from .events import call_state_from_event
-from .isapi import (
-    STATUS_ANSWERED,
-    STATUS_RINGING,
-    ISAPIAuthError,
-    ISAPIClient,
-    ISAPIError,
-    ISAPIUnsupported,
+from .callsource import (
+    STATE_ANSWERED,
+    STATE_IDLE,
+    STATE_RINGING,
+    CallSourceMixin,
 )
+from .isapi import STATUS_ANSWERED, STATUS_RINGING, ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
 
 _LOGGER = logging.getLogger(__name__)
-
-# Call states
-STATE_IDLE = "idle"
-STATE_RINGING = "ringing"
-STATE_ANSWERED = "answered"
 
 # Panel call-status string -> internal call state.
 _ISAPI_STATUS_TO_STATE = {
@@ -61,7 +49,7 @@ _ISAPI_STATUS_TO_STATE = {
 }
 
 
-class BMSIntercomDevice:
+class BMSIntercomDevice(CallSourceMixin):
     """Holds the call state and exposes the actions the UI can trigger.
 
     In demo mode the actions only update local state so the whole flow can be
@@ -88,6 +76,7 @@ class BMSIntercomDevice:
         self._unsub_call_timeout = None
         self._alert_task: asyncio.Task | None = None
         self._use_alert_stream: bool = True
+        self._poll_blocked_until: float = 0.0
 
     # --- options -----------------------------------------------------------
     def _opt(self, key: str, default):
@@ -127,6 +116,26 @@ class BMSIntercomDevice:
         return self._client
 
     @property
+    def call_source(self) -> str:
+        """Where the call state comes from on this panel."""
+        if self.is_demo:
+            return "демо"
+        return "поток событий" if self._use_alert_stream else "опрос callStatus"
+
+    @property
+    def signal_supported(self) -> bool | None:
+        """Does the panel have answer/reject at all? None = not established."""
+        if self.is_demo:
+            return True
+        return None if self._client is None else self._client.call_signal_supported
+
+    @property
+    def snapshot_supported(self) -> bool | None:
+        if self.is_demo:
+            return True
+        return None if self._client is None else self._client.snapshot_supported
+
+    @property
     def rtsp_url(self) -> str | None:
         """RTSP main-stream URL of the panel (real mode only)."""
         if self._client is None:
@@ -159,25 +168,38 @@ class BMSIntercomDevice:
         # Digest is proven on this hardware: never start pinned to a scheme
         # remembered from an earlier, broken session.
         self._client.reset_auth()
-        self._use_alert_stream = bool(
-            self._opt(CONF_USE_ALERT_STREAM, DEFAULT_USE_ALERT_STREAM)
-        )
+        wanted = bool(self._opt(CONF_USE_ALERT_STREAM, DEFAULT_USE_ALERT_STREAM))
+        # Learned earlier that this firmware has no event stream (404)?
+        # Then never spend a restart re-discovering it.
+        known = self.entry.data.get(CONF_ALERT_STREAM_SUPPORTED)
+        self._use_alert_stream = wanted and known is not False
+        if wanted and known is False:
+            _LOGGER.debug(
+                "[%s] Поток событий отключён: модель его не поддерживает", self.name
+            )
         if self._use_alert_stream:
             self._start_alert_stream()
         else:
             self._start_poll()
+        # Learn the capability profile in the background: which commands the
+        # panel has, and whether an ISAPI still image exists at all.
+        self.entry.async_create_background_task(
+            self.hass, self._async_learn_profile(), f"{self.name} profile"
+        )
 
-    def _start_alert_stream(self) -> None:
-        if self._alert_task is None or self._alert_task.done():
-            self._alert_task = self.entry.async_create_background_task(
-                self.hass, self._async_alert_loop(), f"{self.name} alertStream"
-            )
-
-    def _start_poll(self) -> None:
-        if self._unsub_poll is None:
-            self._unsub_poll = async_track_time_interval(
-                self.hass, self._async_poll, timedelta(seconds=CALL_POLL_INTERVAL)
-            )
+    async def _async_learn_profile(self) -> None:
+        """One-off capability discovery, off the setup path."""
+        if self._client is None:
+            return
+        try:
+            await self._client.async_load_capabilities()
+            await self._client.async_select_channel()
+            await self._client.async_snapshot()
+        except ISAPIError as err:
+            _LOGGER.debug("[%s] Профиль панели не прочитан: %s", self.name, err)
+            return
+        self._set_available(True)
+        self._notify()
 
     async def async_shutdown(self) -> None:
         """Stop the listener/poller and close the ISAPI client."""
@@ -219,113 +241,6 @@ class BMSIntercomDevice:
                 self._cancel_call_timeout()
             self._notify()
 
-    # --- event stream ------------------------------------------------------
-    async def _async_alert_loop(self) -> None:
-        """Keep the alertStream connection up, with reconnect and backoff."""
-        backoff = ALERT_BACKOFF_START
-        while True:
-            try:
-                assert self._client is not None
-                async for event in self._client.async_iter_alerts(
-                    on_connect=lambda: self._set_available(True)
-                ):
-                    backoff = ALERT_BACKOFF_START
-                    state = call_state_from_event(event)
-                    _LOGGER.debug(
-                        "[%s] Событие панели: type=%s state=%s -> %s",
-                        self.name, event.get("type"), event.get("state"), state,
-                    )
-                    if state is not None:
-                        self._apply_call_state(state)
-                _LOGGER.debug("[%s] Поток событий закрыт панелью", self.name)
-            except asyncio.CancelledError:
-                raise
-            except ISAPIUnsupported as err:
-                _LOGGER.warning(
-                    "[%s] %s. Переходим на опрос статуса вызова.", self.name, err
-                )
-                self._use_alert_stream = False
-                self._start_poll()
-                return
-            except ISAPIAuthError as err:
-                self._set_available(False, str(err))
-                backoff = ALERT_BACKOFF_MAX
-            except ISAPIError as err:
-                self._set_available(False, str(err))
-                backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
-            except Exception as err:  # noqa: BLE001 - listener must never die
-                _LOGGER.exception("[%s] Сбой потока событий: %s", self.name, err)
-                self._set_available(False, str(err))
-                backoff = min(backoff * 2, ALERT_BACKOFF_MAX)
-            await asyncio.sleep(backoff)
-
-    # --- polling -----------------------------------------------------------
-    async def _async_poll(self, _now) -> None:
-        """Poll fallback: read the panel's call status and reflect it locally."""
-        if self._client is None:
-            return
-        try:
-            raw = await self._client.async_get_call_status()
-        except ISAPIUnsupported as err:
-            # Nothing to poll on this model: stop hammering it every 1.5 s.
-            _LOGGER.warning(
-                "[%s] Опрос статуса вызова недоступен (%s). Состояние вызова "
-                "будет только по потоку событий.", self.name, err,
-            )
-            if self._unsub_poll is not None:
-                self._unsub_poll()
-                self._unsub_poll = None
-            return
-        except ISAPIError as err:
-            self._set_available(False, str(err))
-            return
-
-        self._set_available(True)
-        self._apply_call_state(_ISAPI_STATUS_TO_STATE.get(raw, STATE_IDLE))
-
-    # --- call state --------------------------------------------------------
-    @callback
-    def _apply_call_state(self, new_state: str) -> None:
-        if new_state == self.call_state:
-            if new_state != STATE_IDLE:
-                self._arm_call_timeout()  # keep the safety net fresh
-            return
-        _LOGGER.debug(
-            "[%s] Статус вызова: %s -> %s", self.name, self.call_state, new_state
-        )
-        self.call_state = new_state
-        if new_state == STATE_IDLE:
-            self._cancel_call_timeout()
-        else:
-            self._arm_call_timeout()
-        self._notify()
-
-    @callback
-    def _arm_call_timeout(self) -> None:
-        """A call that never gets an end event must not hang forever."""
-        self._cancel_call_timeout()
-        timeout = self.call_timeout
-        if timeout <= 0:
-            return
-
-        @callback
-        def _expire(_now) -> None:
-            self._unsub_call_timeout = None
-            if self.call_state != STATE_IDLE:
-                _LOGGER.info(
-                    "[%s] Вызов сброшен по таймауту (%s с)", self.name, timeout
-                )
-                self.call_state = STATE_IDLE
-                self._notify()
-
-        self._unsub_call_timeout = async_call_later(self.hass, timeout, _expire)
-
-    @callback
-    def _cancel_call_timeout(self) -> None:
-        if self._unsub_call_timeout is not None:
-            self._unsub_call_timeout()
-            self._unsub_call_timeout = None
-
     # --- Actions -----------------------------------------------------------
     async def async_simulate_call(self) -> None:
         """Demo only: pretend the panel started ringing."""
@@ -334,38 +249,36 @@ class BMSIntercomDevice:
 
     async def async_answer(self) -> None:
         """Answer the call (pick up the handset)."""
-        if self.is_demo:
-            _LOGGER.info("[%s] Вызов принят (демо)", self.name)
-        elif self._client is not None:
-            try:
-                supported = await self._client.async_answer()
-            except ISAPIError as err:
-                _LOGGER.error("[%s] Не удалось ответить: %s", self.name, err)
-                self._set_available(False, str(err))
-                return
-            self._set_available(True)
-            if not supported:
-                _LOGGER.info(
-                    "[%s] У модели нет команды «ответить» — только разговор "
-                    "через поток и реле двери", self.name
-                )
-        self._apply_call_state(STATE_ANSWERED)
+        await self._async_call_signal("answer", STATE_ANSWERED)
 
     async def async_reject(self) -> None:
         """Reject / hang up the call."""
+        await self._async_call_signal("reject", STATE_IDLE)
+
+    async def _async_call_signal(self, cmd: str, new_state: str) -> None:
+        """Send answer/reject where the model has it; otherwise stay local.
+
+        DS-K1T341AM has no callSignal endpoint: the buttons then only move the
+        local call state (the popup and the door relay still work), and the
+        entity attributes say `answer_supported: no` so nobody is misled.
+        """
+        word = "принят" if cmd == "answer" else "сброшен"
         if self.is_demo:
-            _LOGGER.info("[%s] Вызов сброшен (демо)", self.name)
+            _LOGGER.info("[%s] Вызов %s (демо)", self.name, word)
         elif self._client is not None:
             try:
-                supported = await self._client.async_reject()
+                supported = await self._client.async_signal(cmd)
             except ISAPIError as err:
-                _LOGGER.error("[%s] Не удалось сбросить: %s", self.name, err)
+                _LOGGER.error("[%s] Команда «%s» не прошла: %s", self.name, cmd, err)
                 self._set_available(False, str(err))
                 return
             self._set_available(True)
             if not supported:
-                _LOGGER.info("[%s] У модели нет команды «сбросить»", self.name)
-        self._apply_call_state(STATE_IDLE)
+                _LOGGER.debug(
+                    "[%s] У модели нет команды «%s» — меняем только состояние "
+                    "в Home Assistant", self.name, cmd,
+                )
+        self._apply_call_state(new_state)
 
     async def async_open_door(self) -> None:
         """Open the door relay."""

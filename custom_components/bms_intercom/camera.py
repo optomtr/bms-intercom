@@ -50,6 +50,18 @@ class IntercomCamera(BMSIntercomEntity, Camera):
             # Real panel: HA + go2rtc provide the live stream.
             self._attr_supported_features = CameraEntityFeature.STREAM
 
+    @property
+    def use_stream_for_stills(self) -> bool:
+        """Take stills from the RTSP stream when the panel has no snapshot.
+
+        DS-K1T341AM answers 404 on every ISAPI picture endpoint; without this
+        Home Assistant would keep asking and the camera would look broken.
+        """
+        return (
+            not self.device.is_demo
+            and self.device.snapshot_supported is False
+        )
+
     async def stream_source(self) -> str | None:
         if self.device.is_demo:
             return None
@@ -63,7 +75,9 @@ class IntercomCamera(BMSIntercomEntity, Camera):
         if self.device.is_demo:
             return await self.hass.async_add_executor_job(self._render_demo_frame)
         # Real panel: ISAPI still image (digest auth) — this is what the stock
-        # hikvision integration got wrong with "Authentication failed".
+        # hikvision integration got wrong with "Authentication failed". When
+        # the model has no picture endpoint this returns None once and then
+        # `use_stream_for_stills` takes over.
         return await self.device.async_snapshot()
 
     async def handle_async_mjpeg_stream(self, request):

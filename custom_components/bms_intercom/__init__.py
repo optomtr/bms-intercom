@@ -20,6 +20,7 @@ from .const import (
     PLATFORMS,
     SERVICE_PROBE,
 )
+from .callsource import _SKIP_RELOAD
 from .device import BMSIntercomDevice
 from .proxy import HTTPSProxy
 
@@ -119,5 +120,15 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload the entry when its options change."""
+    """Reload the entry when its options change.
+
+    Skipped once when the integration itself wrote down something it learned
+    about the panel (e.g. "this firmware has no event stream") — that is not a
+    user change and must not restart a working intercom.
+    """
+    skip: set[str] = hass.data.get(_SKIP_RELOAD, set())
+    if entry.entry_id in skip:
+        skip.discard(entry.entry_id)
+        _LOGGER.debug("Перезагрузка пропущена: сохранили сведения о панели")
+        return
     await hass.config_entries.async_reload(entry.entry_id)

@@ -155,6 +155,17 @@ def call_signal_calls(cmd: str) -> tuple[Call, ...]:
     )
 
 
+#: Capability document; tells us whether answer/reject exist on this model.
+VIDEO_INTERCOM_CAPABILITIES = "/ISAPI/VideoIntercom/capabilities?format=json"
+
+
+def capability_calls() -> tuple[Call, ...]:
+    return (
+        Call("videoIntercom.capabilities", "GET", VIDEO_INTERCOM_CAPABILITIES),
+        Call("videoIntercom.capabilities.xml", "GET", "/ISAPI/VideoIntercom/capabilities"),
+    )
+
+
 ALERT_STREAM_PATH = "/ISAPI/Event/notification/alertStream"
 
 

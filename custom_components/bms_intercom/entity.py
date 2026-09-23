@@ -9,6 +9,11 @@ from .const import DOMAIN, SIGNAL_STATE_UPDATED
 from .device import BMSIntercomDevice
 
 
+def _yes_no(value: bool | None) -> str:
+    """Tri-state for the attributes: yes / no / not established yet."""
+    return "unknown" if value is None else ("yes" if value else "no")
+
+
 class BMSIntercomEntity(Entity):
     """Groups every entity under one 'Домофон' device and auto-refreshes it."""
 
@@ -49,6 +54,9 @@ class BMSIntercomEntity(Entity):
         )
         if self.device.last_error:
             attrs["panel_error"] = self.device.last_error
+        attrs["call_source"] = self.device.call_source
+        attrs["answer_supported"] = _yes_no(self.device.signal_supported)
+        attrs["snapshot_supported"] = _yes_no(self.device.snapshot_supported)
         return attrs
 
     @property

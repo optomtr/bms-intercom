@@ -28,6 +28,7 @@ from .endpoints import (
     rtsp_url,
     snapshot_paths,
     snippet,
+    status_missing,
     status_ok,
     stream_info_paths,
 )
@@ -41,8 +42,27 @@ _LOGGER = logging.getLogger(__name__)
 AUTH_CHECK_PATH = "/ISAPI/Security/userCheck"
 
 
+def _verdict(value: bool | None, yes: str, no: str) -> str:
+    """Tri-state wording for the report."""
+    if value is None:
+        return "не установлено"
+    return yes if value else no
+
+
 class ProbeMixin:
     """Diagnostics half of ISAPIClient."""
+
+    @staticmethod
+    def _door_verdict(results: list[ProbeResult]) -> str:
+        """What the opt-in door PUT actually answered."""
+        door = [r for r in results if r.name.startswith("door.") and r.method == "PUT"]
+        if not door:
+            return "команда открытия не отправлялась"
+        ok = [r for r in door if r.ok]
+        if ok:
+            return f"ОТКРЫТА командой {ok[0].name} (HTTP {ok[0].status})"
+        codes = ", ".join(f"{r.name} → {r.status}" for r in door)
+        return f"не открылась: {codes}"
 
     async def async_auth_matrix(self, path: str = AUTH_CHECK_PATH) -> dict[str, Any]:
         """Try digest and basic explicitly, side by side, on one endpoint.
@@ -152,7 +172,31 @@ class ProbeMixin:
                 f"/ISAPI/AccessControl/RemoteControl/door/{self._door_no}/capabilities?format=json",
             )
         )
-        results.append(await self._probe_alert_stream())
+        stream_result = await self._probe_alert_stream()
+        results.append(stream_result)
+        if stream_result.ok:
+            self.alert_stream_supported = True
+        elif status_missing(stream_result.status):
+            self.alert_stream_supported = False
+        # The catalogue answers double as capability detection.
+        for result in results:
+            if "capabilities" in result.name and "videoIntercom" in result.name:
+                self.capabilities_raw = result.body
+                body = result.body.lower()
+                if result.ok:
+                    self.call_signal_supported = (
+                        "callsignal" in body or "cmdtype" in body
+                    )
+            if result.name == "snapshot" and result.ok:
+                self.snapshot_supported = True
+        if self.snapshot_supported is None and not any(
+            r.ok for r in results if r.name == "snapshot"
+        ):
+            self.snapshot_supported = False
+        if self.call_signal_supported is None:
+            signal = [r for r in results if r.name.startswith("callSignal")]
+            if signal and not any(r.ok for r in signal):
+                self.call_signal_supported = False
         if test_door:
             for call in door_calls(self._door_no):
                 results.append(
@@ -187,7 +231,21 @@ class ProbeMixin:
             ),
             "каналы (порядок проверки)": ", ".join(str(c) for c in channel_order(self._channel)),
             "успешно": f"{len(working)} из {len(results)}",
-            "реле двери": "проверено командой открытия" if test_door else "не трогали (test_door=false)",
+            "поток событий (alertStream)": _verdict(
+                self.alert_stream_supported, "есть", "нет — работаем опросом callStatus"
+            ),
+            "снимок по ISAPI": _verdict(
+                self.snapshot_supported, "есть", "нет — кадры из RTSP-потока"
+            ),
+            "ответить/сбросить": _verdict(
+                self.call_signal_supported,
+                "есть",
+                "нет — кнопки меняют только состояние в HA",
+            ),
+            "реле двери": (
+                self._door_verdict(results) if test_door
+                else "не трогали (test_door=false)"
+            ),
         }
         return results, summary
 
