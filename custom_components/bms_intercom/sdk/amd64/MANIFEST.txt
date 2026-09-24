@@ -1,0 +1,29 @@
+# bms_talk amd64 — собрано build.sh; не править руками
+# HCNetSDK: pergolafabio/Hikvision-Addons@25230919dacb33800aa84ba90beafb422ee97ee2 hikvision-doorbell/lib-amd64
+# deb: Package: libc6 Version: 2.36-9+deb12u14
+# deb: Package: libgcc-s1 Version: 12.2.0-14+deb12u1
+# deb: Package: libstdc++6 Version: 12.2.0-14+deb12u1
+# deb: Package: libuuid1 Version: 2.38.1-5+deb12u3
+# gcc: 12.2.0
+2405ba7bde553f847df63e86aeb78c837689305b5e2540131ada0f85cc4b7fd1  ./HCNetSDKCom/libAudioIntercom.so
+444d9fa2f5f0eab15fe4b3d598950dfd6e201302b63e88cdaaa50c7b8926e940  ./HCNetSDKCom/libHCCoreDevCfg.so
+c2fb4fd1277b942ee3921d0f8acd355fd7e2a791998a102d49a04ba9ed8e4f81  ./HCNetSDKCom/libHCVoiceTalk.so
+da5d9957f5a00214ced49874bcee189659208f0b988e465f391264697f8b45c4  ./HCNetSDKCom/libiconv2.so
+a416b49da16966b9fa1a0ef4549576a74621edc0af493937bb2e6167b15b7326  ./bms_talk
+02bcda52c1a5dfc236f94d9e5255b4a0e26347d8a372a5223b650e31f291ce3c  ./ld-linux-x86-64.so.2
+f588e0f1f498a0529cedaac83544dbfca05be1b52c40a403588bb0bafbab3db3  ./libHCCore.so
+6b4a45352fd0c540a9c7c718f35ce8c8e46a4e482f9d3885a910c32d1a0e1421  ./libc.so.6
+34912762b32ea3f594144f757805775551d7b52aed8cf8ebd078150e15b70b20  ./libcrypto.so
+34912762b32ea3f594144f757805775551d7b52aed8cf8ebd078150e15b70b20  ./libcrypto.so.1.0.0
+95d521b2c39fd0333271b6fdcdddff878ae82001a304313a837b8e728ebe3cb1  ./libdl.so.2
+2bd1552c47799ef67e701e81d4383061fd76059868e446e63560f0dd0d5ec14e  ./libgcc_s.so.1
+75c534ff190df836591c2df88305abad0ba0587db9d28ae12f837553b9de8649  ./libhcnetsdk.so
+58aeedfe23c074d408f542cfce50bfff5d9bd4b6cff916be2abe4cd29d6549cd  ./libhpr.so
+7f2ca87f652f56b094462474b076749e90e689d0ecb9cb63c7679820b271b4e7  ./libm.so.6
+79795eb466dbecde546357abc852297e183c73e1c2fb3d7fe7e292175800ec6c  ./libopenal.so.1
+b93a680da8a05b939b235c1533572e7a2f6d3d8808bf70209997edc64ea5fedc  ./libpthread.so.0
+41c72def458b8cfb6aab96a7dbada7454dd216d89aac65fb085eb52bead51def  ./librt.so.1
+37a83dec37c3ee5aa816093b525477244f7043ec2cac49449d2b8bf7a7aa1dcc  ./libssl.so
+e7848e32af4932840ba775169041759a2a8dd5a008af360e5c55bce506eebcf4  ./libstdc++.so.6
+94176513740e4b8d24a68e6c37a43986b488f2910c9eaa34f69bd7ba8c49307d  ./libuuid.so.1
+e26c4459b51b2abb7ee7441c3c00e45650a3993ee96c9a0105a8314fbfba7918  ./libz.so

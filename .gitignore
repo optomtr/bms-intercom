@@ -9,3 +9,7 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Служебные файлы хуков Claude Flow — не часть интеграции
+.claude-flow/
+**/.claude-flow/
