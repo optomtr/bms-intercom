@@ -39,6 +39,7 @@ from .callsource import (
     STATE_RINGING,
     CallSourceMixin,
 )
+from .events import PanelEventLog
 from .isapi import ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
 from .talkback import TwoWayAudioError, TwoWayAudioSession
@@ -84,6 +85,8 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
         self._answered = False
         self._answered_at = 0.0
         self._ringing_at = 0.0
+        # Диагностика: последние нераспознанные события (атрибут panel_events).
+        self.panel_event_log = PanelEventLog()
 
     # --- options -----------------------------------------------------------
     def _opt(self, key: str, default):

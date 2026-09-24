@@ -8,6 +8,7 @@ Run: python3 -m unittest discover -s tests -v   (no pytest, no Home Assistant)
 """
 from __future__ import annotations
 
+import json
 import unittest
 
 from _loader import load
@@ -160,6 +161,114 @@ class TestAlertStreamParsing(unittest.TestCase):
         parser = events.AlertStreamParser()
         self.assertEqual(parser.feed(b"<EventNotificationAlert>broken"), [])
         self.assertEqual(parser.feed(b"not xml at all\r\n"), [])
+
+
+
+def acs_event(major: int, sub: int, **extra) -> dict:
+    """AccessControllerEvent в форме ISAPI JSON (с персональными полями)."""
+    body = {
+        "deviceName": "Access Controller",
+        "majorEventType": major,
+        "subEventType": sub,
+        "name": "Иванов Иван",
+        "employeeNoString": "1007",
+        "cardNo": "0012345678",
+        "pictureURL": "http://192.168.70.121/LOCALS/pic/acsLinkCap/1.jpg@WEB0",
+        "cardReaderNo": 1,
+        "serialNo": 4242,
+        **extra,
+    }
+    doc = events.parse_document(json.dumps({
+        "ipAddress": "192.168.70.121",
+        "dateTime": "2026-09-24T10:00:00+05:00",
+        "eventType": "AccessControllerEvent",
+        "eventState": "active",
+        "AccessControllerEvent": body,
+    }))
+    assert doc is not None
+    return doc
+
+
+PRIVATE_KEYS = ("name", "employeenostring", "cardno", "pictureurl",
+                "devicename", "cardreaderno")
+
+
+class TestAccessControllerCall(unittest.TestCase):
+    """Кнопка «Вызов» терминала: MAJOR_EVENT 0x5 + 0x25/0x33 (HCNetSDK/ISAPI)."""
+
+    def test_doorbell_ringing_code_rings(self):
+        self.assertEqual(
+            events.call_state_from_event(acs_event(5, 0x25)), events.STATE_RINGING
+        )
+
+    def test_call_center_code_rings(self):
+        self.assertEqual(
+            events.call_state_from_event(acs_event(5, 0x33)), events.STATE_RINGING
+        )
+
+    def test_other_codes_are_not_a_call(self):
+        # 5/75 — лицо распознано; 3/0x25 — тот же минор, но другой major.
+        self.assertIsNone(events.call_state_from_event(acs_event(5, 75)))
+        self.assertIsNone(events.call_state_from_event(acs_event(3, 0x25)))
+
+
+class TestPanelEventLog(unittest.TestCase):
+    def test_unrecognised_event_is_kept_without_personal_fields(self):
+        event = acs_event(5, 75)
+        self.assertIsNone(events.call_state_from_event(event))
+        log = events.PanelEventLog()
+        line, loud = log.add(event, 0.0, "2026-09-24T10:00:00+05:00")
+        self.assertTrue(loud)
+        [item] = log.items
+        self.assertEqual(item["type"], "accesscontrollerevent")
+        self.assertEqual(item["state"], "active")
+        self.assertEqual(item["time"], "2026-09-24T10:00:00+05:00")
+        fields = item["fields"]
+        self.assertEqual(fields["majoreventtype"], "5")
+        self.assertEqual(fields["subeventtype"], "75")
+        self.assertEqual(fields["serialno"], "4242")
+        self.assertEqual(fields["ipaddress"], "192.168.70.121")  # IP можно
+        for key in PRIVATE_KEYS:
+            self.assertNotIn(key, fields)
+        for secret in ("Иванов", "1007", "0012345678", "acsLinkCap"):
+            self.assertNotIn(secret, line)
+            self.assertNotIn(secret, str(log.items))
+        self.assertIn("majoreventtype=5", line)
+        self.assertIn("subeventtype=75", line)
+
+    def test_long_values_are_dropped(self):
+        log = events.PanelEventLog()
+        log.add(acs_event(5, 75, blob="x" * 81, short="y" * 80), 0.0, "t")
+        fields = log.items[0]["fields"]
+        self.assertNotIn("blob", fields)
+        self.assertEqual(fields["short"], "y" * 80)
+
+    def test_only_the_last_ten_are_kept(self):
+        log = events.PanelEventLog()
+        for n in range(15):
+            log.add(acs_event(5, 100 + n), float(n), f"t{n}")
+        items = log.items
+        self.assertEqual(len(items), 10)
+        self.assertEqual(items[0]["time"], "t5")
+        self.assertEqual(items[-1]["fields"]["subeventtype"], "114")
+
+    def test_info_once_per_signature_per_ten_minutes(self):
+        log = events.PanelEventLog()
+        self.assertTrue(log.add(acs_event(5, 75), 0.0, "a")[1])
+        self.assertFalse(log.add(acs_event(5, 75), 1.0, "b")[1])
+        self.assertTrue(log.add(acs_event(5, 76), 2.0, "c")[1])   # другая сигнатура
+        self.assertFalse(log.add(acs_event(5, 75), 599.0, "d")[1])
+        self.assertTrue(log.add(acs_event(5, 75), 600.0, "e")[1])
+        self.assertEqual(len(log.items), 5)  # в атрибут идут все, тише — только журнал
+
+    def test_stream_heartbeat_is_not_kept(self):
+        log = events.PanelEventLog()
+        beat = events.parse_document(
+            "<EventNotificationAlert><eventType>videoloss</eventType>"
+            "<eventState>inactive</eventState></EventNotificationAlert>"
+        )
+        self.assertIsNone(log.add(beat, 0.0, "t"))
+        self.assertEqual(log.items, [])
 
 
 if __name__ == "__main__":

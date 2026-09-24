@@ -28,6 +28,7 @@ if HAVE_HA:
     callsource = load("callsource")
     device_mod = load("device")
     isapi = load("isapi")
+    binary_sensor = load("binary_sensor")
     from test_ds_k1t341am import Panel
 
 
@@ -411,6 +412,58 @@ class TestStreamFallback(DeviceTestCase):
             self.assertFalse(device._use_alert_stream)
             self.assertIsNone(device._alert_task)
             self.assertEqual(len(self.sched.intervals), 1)
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+
+def acs_part(sub: int) -> str:
+    """Одна часть alertStream терминала: AccessControllerEvent в JSON."""
+    return (
+        "--MIME_boundary\r\nContent-Type: application/json; charset=\"UTF-8\"\r\n\r\n"
+        '{"ipAddress":"192.168.70.121","eventType":"AccessControllerEvent",'
+        '"eventState":"active","AccessControllerEvent":{"majorEventType":5,'
+        f'"subEventType":{sub},"name":"Иванов Иван","employeeNoString":"1007",'
+        '"pictureURL":"http://192.168.70.121/LOCALS/pic/1.jpg"}}\r\n'
+    )
+
+
+class TestPanelEventsAttribute(DeviceTestCase):
+    """0.3.1: нажатие «Вызов» на DS-K1T341AM шло accesscontrollerevent-ом,
+    а мы его не узнавали и не показывали, что именно пришло."""
+
+    def test_stream_events_reach_the_call_sensor(self):
+        panel = Panel()
+        sent = {"n": 0}
+
+        def handler(request):
+            if "alertStream" in request.url.path:
+                sent["n"] += 1
+                # Первое подключение — событие «лицо», второе — кнопка вызова.
+                body = acs_part(75) if sent["n"] == 1 else acs_part(0x25)
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "multipart/mixed; boundary=MIME_boundary"},
+                    text=body,
+                )
+            return panel(request)
+
+        self.use_panel(handler)
+
+        async def main():
+            device, _hass, entry = self.make_device()
+            await device.async_setup()
+            ok = await self.settle(entry, lambda: device.call_state == "ringing")
+            self.assertTrue(ok, "кнопка вызова 5/0x25 не дала звонок")
+            attrs = binary_sensor.CallBinarySensor(device).extra_state_attributes
+            events = attrs["panel_events"]
+            self.assertTrue(events)
+            # В атрибуте только нераспознанное (5/75), без персональных полей.
+            self.assertEqual({e["fields"]["subeventtype"] for e in events}, {"75"})
+            for e in events:
+                for key in ("name", "employeenostring", "pictureurl"):
+                    self.assertNotIn(key, e["fields"])
+            self.assertNotIn("Иванов", str(attrs))
             await self.shutdown(device, entry)
 
         asyncio.run(main())
