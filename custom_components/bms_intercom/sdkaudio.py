@@ -47,12 +47,28 @@ _SDK_ERRORS = {
     1: "неверный логин или пароль терминала",
     7: "терминал не отвечает на порту SDK",
     10: "терминал не ответил вовремя",
+    # 11/31 — ответ StartVoiceCom сразу после входа, пока терминал в своём
+    # режиме вызова (живой DS-K1T341AM, 0.3.6): голос занят его звонком.
+    11: "терминал не открыл голос — занят своим вызовом",
+    31: "терминал занят",
     153: "учётная запись терминала заблокирована после неверных паролей",
 }
 
 
+#: Коды «терминал занят своим вызовом»: их лечит reject/hangUp + повтор (talkroute).
+BUSY_CODES = (11, 31)
+
+
 class SDKAudioError(Exception):
-    """Голос по SDK не открылся или оборвался; текст — для журнала и атрибута."""
+    """Голос по SDK не открылся или оборвался; текст — для журнала и атрибута.
+
+    `code` — код HCNetSDK из ответа помощника (None, если ответа не было):
+    по нему talkroute решает, повторять ли открытие.
+    """
+
+    def __init__(self, text: str, code: int | None = None) -> None:
+        super().__init__(text)
+        self.code = code
 
 
 def describe_error(code: object, message: object) -> str:
@@ -177,6 +193,11 @@ class SDKTalkSession:
         self._secret = ""
         self._lock = asyncio.Lock()
 
+    @property
+    def alive(self) -> bool:
+        """Помощник запущен и не вышел: второй talk_start может ехать на нём."""
+        return self._proc is not None and self._proc.returncode is None
+
     async def async_open(self, host: str, port: int, user: str, password: str) -> str:
         """Запустить помощника, войти на терминал; вернуть кодек или SDKAudioError."""
         helper = await _async_helper()
@@ -205,6 +226,11 @@ class SDKTalkSession:
         except (BrokenPipeError, ConnectionResetError) as err:
             await self.async_close()
             raise SDKAudioError("помощник голоса завершился при запуске") from err
+        except asyncio.CancelledError:
+            # talk_stop во время входа (оператор нажал «Сбросить»): помощник
+            # не должен остаться с открытым голосом к терминалу.
+            await self.async_close()
+            raise
         reply = _parse_line(line)
         if reply.get("type") == "started":
             self.codec = str(reply.get("codec") or self.codec)
@@ -212,7 +238,9 @@ class SDKTalkSession:
             return self.codec
         await self.async_close()
         if reply.get("type") == "error":
-            raise SDKAudioError(describe_error(reply.get("code"), reply.get("message")))
+            code = reply.get("code")
+            raise SDKAudioError(describe_error(code, reply.get("message")),
+                                code if isinstance(code, int) else None)
         raise SDKAudioError(
             f"помощник голоса завершился без ответа (код выхода {proc.returncode})"
         )

@@ -14,6 +14,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,8 +30,11 @@ if HAVE_HA:
     sdkaudio = load("sdkaudio")
     entity_mod = load("entity")
     integration = load("__init__")
+    talkroute = load("talkroute")
     from test_device import REAL, DeviceTestCase
     from test_ds_k1t341am import Panel
+    from test_reject import sent_commands
+    from test_test_call import CallPanel
 else:  # pragma: no cover
     DeviceTestCase = unittest.TestCase
 
@@ -71,12 +75,14 @@ class SDKTalkCase(DeviceTestCase):
         with open(path, "rb") as fh:
             return fh.read()
 
-    async def up(self, data=None):
-        self.use_panel(Panel())   # DS-K1T341AM: TwoWayAudio → 404 notSupport
+    async def up(self, data=None, panel=None):
+        # DS-K1T341AM: TwoWayAudio → 404 notSupport (у CallPanel — тоже).
+        self.use_panel(panel or Panel())
         device, hass, entry = self.make_device(data)
         hass.data["bms_intercom"] = {entry.entry_id: device}
         await device.async_setup()
-        await self.settle(entry, lambda: device._sdk_ok is not None)
+        await self.settle(entry, lambda: device._sdk_ok is not None
+                          and device.signal_supported is not None)
         return device, hass, entry
 
     async def ws(self, hass, name, **extra):
@@ -127,6 +133,115 @@ class TestTalkThroughTheHelper(SDKTalkCase):
             self.assertNotIn(secret, log, "пароль терминала в журнале HA")
             # …а сама строка журнала помощника дошла (иначе проверка пустая).
             self.assertIn("login admin:***@", log)
+            self.assertIsNone(device._talk)
+            # Повторный вход с плохим паролем заблокировал бы учётку терминала.
+            self.assertEqual(self.recorded(".runs"), b"1", "неверный пароль повторён")
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+
+class TestBusyTerminal(SDKTalkCase):
+    """0.3.6: терминал в своём режиме вызова отвечает на StartVoiceCom кодом 11.
+
+    С живого DS-K1T341AM: вход проходит, голос — «ошибка 11», пока на
+    терминале настоящий вызов. Лечение — reject/hangUp на терминал без смены
+    вызова в HA и повтор открытия.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self._pauses = talkroute.SDK_BUSY_PAUSES
+        talkroute.SDK_BUSY_PAUSES = (0.01,) * len(self._pauses)
+
+    def tearDown(self):
+        talkroute.SDK_BUSY_PAUSES = self._pauses
+        super().tearDown()
+
+    async def answered(self, busy):
+        """Настоящий вызов принят в поп-апе; помощник занят первые `busy` раз."""
+        self.use_helper([sys.executable, str(FAKE), self.record, "--busy", str(busy)])
+        panel = CallPanel("rings")
+        device, hass, entry = await self.up(panel=panel)
+        self.assertIs(device.signal_supported, True)
+        device._apply_panel_state("ringing")
+        await device.async_answer()
+        self.assertEqual(device.call_state, "answered")
+        panel.signals.clear()
+        return device, hass, entry, panel
+
+    def runs(self):
+        return int(self.recorded(".runs") or b"0")
+
+    def test_busy_once_frees_the_terminal_keeps_the_call_and_talks(self):
+        chunk = bytes(range(256)) * 3
+
+        async def main():
+            device, hass, entry, panel = await self.answered(busy=1)
+            with self.assertLogs("bms_intercom_under_test", level="INFO") as cm:
+                await self.ws(hass, "talk_start")
+            self.assertEqual(sent_commands(panel), ["reject", "hangUp"])
+            self.assertEqual(self.runs(), 2, "второго открытия не было")
+            self.assertIn("открыт с попытки 2 из 5", "\n".join(cm.output))
+            self.assertIsNotNone(device._talk)
+            self.assertEqual(device.talk_error, "")
+            # Вызов в HA не тронут: разговор, латч, без паузы «после Сбросить».
+            self.assertEqual(device.call_state, "answered")
+            self.assertTrue(device._answered)
+            self.assertLess(device._ring_quiet_until, time.monotonic())
+            device._apply_panel_state("idle")   # терминал освобождён — опрос говорит idle
+            self.assertEqual(device.call_state, "answered", "поп-ап закрылся")
+
+            await self.ws(hass, "talk_data", data=base64.b64encode(chunk).decode())
+            await self.settle(entry, lambda: self.recorded(".audio") == chunk)
+            self.assertEqual(self.recorded(".audio"), chunk, "голос не пошёл")
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+    def test_always_busy_is_a_clear_error_and_the_popup_stays(self):
+        async def main():
+            device, hass, entry, panel = await self.answered(busy=99)
+            await self.ws(hass, "talk_start")
+            self.assertEqual(self.runs(), 5)
+            self.assertEqual(sent_commands(panel), ["reject", "hangUp"] * 4)
+            self.assertEqual(
+                device.talk_error,
+                "голос по SDK: терминал не открыл голос — занят своим вызовом "
+                "(код 11); не освободился за 5 попыток",
+            )
+            self.assertEqual(self.attrs(device)["talk_error"], device.talk_error)
+            self.assertIsNone(device._talk)
+            self.assertEqual(device.call_state, "answered")
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+    def test_double_talk_start_runs_one_helper(self):
+        async def main():
+            device, hass, entry, panel = await self.answered(busy=0)
+            # «Ответить» и кнопка микрофона почти одновременно.
+            await asyncio.gather(self.ws(hass, "talk_start"), self.ws(hass, "talk_start"))
+            self.assertEqual(self.runs(), 1, "запущен второй помощник")
+            await self.ws(hass, "talk_start")   # голос уже открыт — берём его
+            self.assertEqual(self.runs(), 1)
+            self.assertIsNotNone(device._talk)
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+    def test_talk_stop_during_retries_stops_them(self):
+        async def main():
+            talkroute.SDK_BUSY_PAUSES = (0.3,) * len(self._pauses)
+            device, hass, entry, panel = await self.answered(busy=99)
+            start = asyncio.create_task(self.ws(hass, "talk_start"))
+            await self.settle(entry, lambda: len(panel.signals) >= 2)
+            await self.ws(hass, "talk_stop")        # «Сбросить» во время повторов
+            await asyncio.wait_for(start, 3)
+            runs = self.runs()
+            await asyncio.sleep(0.5)
+            self.assertEqual(self.runs(), runs, "повторы идут после talk_stop")
+            self.assertLess(runs, 5)
             self.assertIsNone(device._talk)
             await self.shutdown(device, entry)
 
