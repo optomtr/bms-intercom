@@ -56,8 +56,9 @@ class BMSIntercomEntity(Entity):
             attrs["panel_error"] = self.device.last_error
         attrs["call_source"] = self.device.call_source
         attrs["answer_supported"] = _yes_no(self.device.signal_supported)
-        # Поп-ап по talk_supported: no прячет «Микрофон» (DS-K1T341AM).
-        attrs["talk_supported"] = _yes_no(self.device.talk_supported)
+        # Поп-ап по talk_supported: no прячет «Микрофон»; talk_via — дорога
+        # голоса (isapi/sdk/none), talk_hint — почему голоса нет (talkroute).
+        attrs.update(self.device.talk_attributes)
         attrs["snapshot_supported"] = _yes_no(self.device.snapshot_supported)
         return attrs
 

@@ -29,6 +29,7 @@ if HAVE_HA:
     device_mod = load("device")
     isapi = load("isapi")
     binary_sensor = load("binary_sensor")
+    sdkaudio = load("sdkaudio")
     from test_ds_k1t341am import Panel
 
 
@@ -116,7 +117,12 @@ class DeviceTestCase(unittest.TestCase):
             "client": device_mod.ISAPIClient,
             "backoff_start": callsource.ALERT_BACKOFF_START,
             "backoff_max": callsource.ALERT_BACKOFF_MAX,
+            "sdk_helper": sdkaudio._prepare_helper,
         }
+        # Помощник SDK — внешний процесс: по умолчанию его «нет», чтобы тесты
+        # не зависели от того, что лежит в sdk/ и на какой машине они идут.
+        sdkaudio._prepare_helper = lambda: sdkaudio.NO_PLATFORM
+        sdkaudio.reset_cache()
         callsource.async_track_time_interval = self.sched.track_interval
         callsource.async_call_later = self.sched.call_later
         self.notifications = 0
@@ -135,6 +141,8 @@ class DeviceTestCase(unittest.TestCase):
         device_mod.ISAPIClient = self._saved["client"]
         callsource.ALERT_BACKOFF_START = self._saved["backoff_start"]
         callsource.ALERT_BACKOFF_MAX = self._saved["backoff_max"]
+        sdkaudio._prepare_helper = self._saved["sdk_helper"]
+        sdkaudio.reset_cache()
 
     def use_panel(self, handler):
         real_client = self._saved["client"]

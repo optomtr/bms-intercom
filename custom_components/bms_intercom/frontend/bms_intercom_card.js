@@ -11,7 +11,8 @@
  *
  * Видео и звук панели идут через одно WebRTC-соединение к камере
  * (camera/webrtc/offer Home Assistant → go2rtc). Микрофон оператора идёт
- * отдельно: G.711 по WebSocket интеграции (bms_intercom/talk_*) → ISAPI панели.
+ * отдельно: G.711 µ-law по WebSocket интеграции (bms_intercom/talk_*) → панели
+ * по ISAPI или, если ISAPI звук не принимает, через помощник HCNetSDK.
  * Камера без STREAM (демо-режим) показывается MJPEG-картинкой.
  *
  * Один файл намеренно: киоск на file:// подгружает его обычным <script>, где
@@ -97,6 +98,7 @@
       if (a.intercom_https_base) g.httpsBase = a.intercom_https_base;
       if (a.intercom_https_port) g.httpsPort = a.intercom_https_port;
       if (a.talk_supported) g.talkSupported = a.talk_supported;
+      if (a.talk_hint) g.talkHint = a.talk_hint;
       if (a.intercom_role === "call") {
         g.callState = a.call_state || (st.state === "on" ? "ringing" : "idle");
       }
@@ -257,7 +259,7 @@
     if (entity) hass.callService("button", "press", { entity_id: entity });
     if (role === "answer") {
       setMuted(false);   // звук панели всегда включён в разговоре
-      if (talkUnsupported(g)) noteListenOnly();
+      if (talkUnsupported(g)) noteListenOnly(g);
       else startMic(true); // микрофон оператора включён по умолчанию (тихо)
     } else if (role === "open_door") {
       // Открытие двери завершает вызов автоматически.
@@ -277,15 +279,19 @@
     }
   }
 
-  // Терминал без two-way audio по ISAPI (DS-K1T341AM: talk_supported=no):
-  // микрофон не захватываем и не зовём talk_start — голос всё равно не дойдёт,
-  // а тост «откройте по HTTPS» только сбивал бы с толку.
+  // Голосу оператора некуда идти (talk_supported=no: ни ISAPI two-way audio,
+  // ни помощника HCNetSDK): микрофон не захватываем и не зовём talk_start —
+  // голос всё равно не дойдёт, а тост «откройте по HTTPS» только сбивал бы.
+  // talk_supported=yes — кнопка есть, какой бы дорогой (talk_via) ни шёл голос.
   function talkUnsupported(g) { return !!g && g.talkSupported === "no"; }
-  let listenOnlyNoted = false;
-  function noteListenOnly() {
-    if (listenOnlyNoted) return; // один раз за загрузку страницы, не на каждый звонок
-    listenOnlyNoted = true;
-    showToast("Терминал не принимает голос с HA — только слушать");
+  let listenOnlyNoted = "";
+  function noteListenOnly(g) {
+    // talk_hint — причина от интеграции (например, нет помощника под эту платформу).
+    const msg = g && g.talkHint ? "Только слушать: " + g.talkHint
+      : "Терминал не принимает голос с HA — только слушать";
+    if (listenOnlyNoted === msg) return; // один раз за загрузку страницы, не на каждый звонок
+    listenOnlyNoted = msg;
+    showToast(msg);
   }
   function applyTalkSupport(g) {
     const btn = overlay && overlay.querySelector(".bms-mic");

@@ -73,6 +73,17 @@ class TestPopupCard(unittest.TestCase):
         """Контроль к предыдущему: та же проверка видит работающий микрофон."""
         self.assertEqual(self.assertSurvives("talk_yes"), {"hidden": False, "gum": 1})
 
+    def test_no_voice_with_a_hint_says_why_once(self):
+        """0.3.5: talk_supported=no + talk_hint → тост с причиной, один раз."""
+        got = self.assertSurvives("talk_hint")
+        self.assertTrue(got["hidden"], "кнопка «Микрофон» видна")
+        self.assertEqual(got["first"], "Только слушать: голос по SDK недоступен на этой платформе")
+        self.assertEqual(got["second"], "", "тост повторяется на каждый ответ")
+
+    def test_voice_through_the_sdk_keeps_the_mic(self):
+        """0.3.5: talk_via=sdk (DS-K1T341AM через HCNetSDK) — микрофон как у ISAPI."""
+        self.assertEqual(self.assertSurvives("talk_sdk"), {"hidden": False, "gum": 1})
+
     def test_a_failing_tick_is_logged_once_not_every_400ms(self):
         self.assertSurvives("safe_tick_swallows")
         self.assertEqual(self.out["warnings"], 1)

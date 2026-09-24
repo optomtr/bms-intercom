@@ -58,7 +58,7 @@ async def _ws_talk_start(hass, connection, msg) -> None:
     {
         vol.Required("type"): f"{DOMAIN}/talk_data",
         vol.Required("entry_id"): str,
-        vol.Required("data"): str,  # base64, сырой G.711
+        vol.Required("data"): str,  # base64, сырой G.711 µ-law (ISAPI или SDK — решает talkroute)
     }
 )
 @websocket_api.async_response

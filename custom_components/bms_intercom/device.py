@@ -42,13 +42,13 @@ from .callsource import (
 from .events import PanelEventLog
 from .isapi import ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
-from .talkback import TwoWayAudioError, TwoWayAudioSession, TwoWayAudioUnsupported
+from .talkroute import TalkRouteMixin
 from .testcall import TEST_CALL_SOURCE, CallTestMixin
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
+class BMSIntercomDevice(CallTestMixin, CallSourceMixin, TalkRouteMixin):
     """Holds the call state and exposes the actions the UI can trigger.
 
     In demo mode the actions only update local state so the whole flow can be
@@ -76,12 +76,10 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
         self._alert_task: asyncio.Task | None = None
         self._use_alert_stream: bool = True
         self._poll_blocked_until: float = 0.0
-        # Из форка: idle-просмотр (переключатель «Просмотр»), микрофон к панели,
-        # латч разговора и окно звонка (см. callsource._apply_panel_state).
+        # Из форка: idle-просмотр (переключатель «Просмотр»), микрофон к панели
+        # (talkroute), латч разговора и окно звонка (callsource._apply_panel_state).
         self.view_active: bool = False
-        self._talk: TwoWayAudioSession | None = None
-        self._talk_bytes = 0
-        self._talk_logged_at = 0
+        self._init_talk()
         self._answered = False
         self._answered_at = 0.0
         self._ringing_at = 0.0
@@ -142,13 +140,6 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
         if self.is_demo:
             return True
         return None if self._client is None else self._client.call_signal_supported
-
-    @property
-    def talk_supported(self) -> bool | None:
-        """Принимает ли панель голос оператора по ISAPI. None = не выяснено."""
-        if self.is_demo:
-            return True
-        return None if self._client is None else self._client.talk_supported
 
     @property
     def snapshot_supported(self) -> bool | None:
@@ -229,6 +220,8 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
             await self._client.async_ensure_twoway_codec()
         except ISAPIError as err:
             _LOGGER.debug("[%s] Кодек two-way audio не задан: %s", self.name, err)
+        # ISAPI звук не принимает (DS-K1T341AM) → есть ли помощник SDK.
+        await self._async_route_talk()
         # Вердикт talk_supported выяснен только что — поп-ап прячет «Микрофон».
         self._notify()
 
@@ -272,69 +265,6 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
                 # Unreachable panel: the call state is unknown, not "idle".
                 self._cancel_call_timeout()
             self._notify()
-
-    # --- Микрофон оператора → панель (native ISAPI two-way audio) ----------
-    async def async_talk_start(self) -> None:
-        """Открыть канал two-way audio панели под микрофон оператора."""
-        if self.is_demo:
-            return
-        host = self.entry.data.get(CONF_HOST)
-        if not host:
-            return
-        if self.talk_supported is False:
-            # Не стучимся в open/audioData модели, которая звук не принимает.
-            _LOGGER.debug("[%s] Микрофон не открыт: панель не принимает звук", self.name)
-            return
-        # Закрываем прошлую сессию (вкладку закрыли без talk_stop) — иначе к
-        # панели останется висеть two-way-сокет и новый не откроется.
-        await self.async_talk_stop()
-        sess = TwoWayAudioSession(
-            host,
-            self._opt(CONF_HTTP_PORT, DEFAULT_HTTP_PORT),
-            self.entry.data.get(CONF_USERNAME, ""),
-            self.entry.data.get(CONF_PASSWORD, ""),
-        )
-        try:
-            await sess.async_open()
-        except TwoWayAudioUnsupported as err:
-            # Профиль при старте мог не прочитаться (панель была офлайн) —
-            # запоминаем вердикт здесь, чтобы поп-ап убрал кнопку.
-            _LOGGER.warning("[%s] Микрофон к панели: %s", self.name, err)
-            await sess.async_close()
-            if self._client is not None:
-                self._client.talk_supported = False
-                self._notify()
-            return
-        except Exception as err:  # noqa: BLE001 - микрофон не должен ронять HA
-            _LOGGER.warning("[%s] Не удалось открыть микрофон к панели: %s", self.name, err)
-            await sess.async_close()
-            return
-        self._talk = sess
-        self._talk_bytes = 0
-        self._talk_logged_at = 0
-        _LOGGER.debug("[%s] Микрофон к панели открыт (кодек %s)", self.name, sess.codec)
-
-    async def async_talk_send(self, data: bytes) -> None:
-        """Передать кусок G.711 от браузера на панель."""
-        if self._talk is None:
-            return
-        try:
-            await self._talk.async_send(data)
-        except TwoWayAudioError as err:
-            _LOGGER.warning("[%s] Микрофон: поток к панели оборвался (%s)", self.name, err)
-            await self.async_talk_stop()
-            return
-        # Раз в ~2 с (16000 байт при 8 кГц) отметить в debug, что звук уходит.
-        self._talk_bytes += len(data)
-        if self._talk_bytes - self._talk_logged_at >= 16000:
-            self._talk_logged_at = self._talk_bytes
-            _LOGGER.debug("[%s] Микрофон → панель: отправлено %d Б", self.name, self._talk_bytes)
-
-    async def async_talk_stop(self) -> None:
-        """Закрыть канал two-way audio панели."""
-        sess, self._talk = self._talk, None
-        if sess is not None:
-            await sess.async_close()
 
     # --- Actions -----------------------------------------------------------
     async def async_set_view(self, on: bool) -> None:

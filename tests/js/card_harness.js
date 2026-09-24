@@ -118,15 +118,16 @@ attempt("toast_show_takes_clicks", () =>
 
 // 8. Терминал без two-way audio (talk_supported=no): в разговоре кнопки
 // «Микрофон» нет, «Ответить» не трогает микрофон и talk_start, тост — один раз.
-function talking(id, talk) {
+function talking(id, talk, extra) {
   const sent = [];
+  const more = extra || {};
   const hass = {
     states: {
       [`binary_sensor.${id}_vyzov`]: { entity_id: `binary_sensor.${id}_vyzov`, state: "on",
         attributes: { intercom_id: id, intercom_name: "Терминал", intercom_role: "call",
-                      call_state: "answered", talk_supported: talk } },
+                      call_state: "answered", talk_supported: talk, ...more } },
       [`button.${id}_answer`]: { entity_id: `button.${id}_answer`, state: "unknown",
-        attributes: { intercom_id: id, intercom_role: "answer", talk_supported: talk } },
+        attributes: { intercom_id: id, intercom_role: "answer", talk_supported: talk, ...more } },
     },
     callService() {},
     connection: { sendMessagePromise(m) { sent.push(m.type); return new Promise(() => {}); } },
@@ -151,6 +152,27 @@ attempt("talk_no", () => {
 // Контроль: модель с two-way audio — кнопка есть, микрофон захватывается.
 attempt("talk_yes", () => {
   talking("e3", "yes");
+  api.tick();
+  const hidden = micHidden();
+  const gum0 = gumCalls;
+  api.callRole("answer");
+  return { hidden, gum: gumCalls - gum0 };
+});
+// 9. Голоса нет, и интеграция говорит почему (talk_hint): тост с причиной, один раз.
+attempt("talk_hint", () => {
+  talking("e4", "no", { talk_via: "none", talk_hint: "голос по SDK недоступен на этой платформе" });
+  api.tick();
+  const hidden = micHidden();
+  toast().textContent = "";
+  api.callRole("answer");
+  const first = toast().textContent;
+  toast().textContent = "";
+  api.callRole("answer");
+  return { hidden, first, second: toast().textContent };
+});
+// 10. Терминал с голосом через HCNetSDK (talk_via=sdk) — «Микрофон» как у ISAPI.
+attempt("talk_sdk", () => {
+  talking("e5", "yes", { talk_via: "sdk" });
   api.tick();
   const hidden = micHidden();
   const gum0 = gumCalls;
