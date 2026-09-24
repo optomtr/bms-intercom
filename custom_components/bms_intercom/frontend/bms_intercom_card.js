@@ -752,7 +752,7 @@
   // его сам при загрузке/включении экрана.
   function playRing() {
     if (!audio) return;
-    if (!audio.getAttribute("src")) audio.src = assetUrl(`${STATIC}/ring1.mp3`);
+    if (!audio.getAttribute("src")) audio.src = assetUrl(`${STATIC}/ring_bms_velvet.mp3`);
     audio.currentTime = 0;
     audio.play().catch(() => {});
   }
