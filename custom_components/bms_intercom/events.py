@@ -16,6 +16,7 @@ import json
 import logging
 import re
 import xml.etree.ElementTree as ET
+from collections import deque
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +41,20 @@ CALL_EVENT_TYPES = {
     "callsignal",
     "callhelp",
 }
+
+#: Нажатие кнопки вызова на терминале доступа (DS-K1T341AM и родня) приходит
+#: не как videoIntercom, а как AccessControllerEvent с числовыми кодами.
+#: Коды — документированные Hikvision, раздел MAJOR_EVENT (0x5) таблицы
+#: «Access Control Event Types» ISAPI / заголовка HCNetSDK.h:
+#:   MINOR_DOORBELL_RINGING = 0x25 (37) — «Doorbell ring»,
+#:   MINOR_CALL_CENTER      = 0x33 (51) — «Call center» (кнопка настроена
+#:                                        звонить на центр управления).
+#: https://tpp.hikvision.com/Wiki/ISAPI/Access%20Control%20on%20Person/GUID-079BE986-6D55-4F18-A4F2-A73DBD7442F9.html
+#: https://github.com/Chise1/pyhk/blob/master/hcn_define.h (MAJOR_EVENT 0x5)
+#: В alertStream ISAPI коды приходят десятичными числами (majorEventType=5).
+ACS_EVENT_TYPE = "accesscontrollerevent"
+ACS_MAJOR_EVENT = 0x5
+ACS_CALL_MINORS = frozenset({0x25, 0x33})
 
 #: Exact status words, lowercased.
 _EXACT = {
@@ -255,8 +270,30 @@ def _match_word(value: str) -> str | None:
     return None
 
 
+def _int_field(fields: dict[str, str], key: str) -> int | None:
+    try:
+        return int(fields.get(key, "").strip())
+    except ValueError:
+        return None
+
+
+def is_acs_call(event: dict[str, Any]) -> bool:
+    """Кнопка вызова на терминале доступа (см. ACS_CALL_MINORS)."""
+    if event.get("type", "") != ACS_EVENT_TYPE:
+        return False
+    fields = event.get("fields", {})
+    return (
+        _int_field(fields, "majoreventtype") == ACS_MAJOR_EVENT
+        and _int_field(fields, "subeventtype") in ACS_CALL_MINORS
+    )
+
+
 def call_state_from_event(event: dict[str, Any] | None) -> str | None:
     """Map one parsed event to idle/ringing/answered, or None if unrelated."""
+    if event and is_acs_call(event):
+        # Разовое событие: «конца звонка» терминал не присылает, сброс делают
+        # окно звонка и таймер вызова (callsource).
+        return STATE_RINGING
     if not event or not is_call_event(event):
         return None
     fields: dict[str, str] = event.get("fields", {})
@@ -275,3 +312,106 @@ def call_state_from_event(event: dict[str, Any] | None) -> str | None:
     if state_flag == "active":
         return STATE_RINGING
     return None
+
+
+# --- диагностика: нераспознанные события панели ------------------------------
+#: Поля, в названии которых есть эти куски, не пишем ни в журнал, ни в атрибут:
+#: персональные данные (имя, табельный номер, карта, телефон, пароль) и тяжёлое
+#: (ссылки на фото лица). Атрибут видит любой пользователь HA и он уходит
+#: в интерфейс — персональное туда попадать не должно.
+_PRIVATE_KEY_PARTS = (
+    "name", "employee", "card", "person", "picture", "pic", "url", "face",
+    "phone", "pwd", "password",
+)
+#: Длинные значения (base64, XML-обрывки) — это шум, а не код события.
+MAX_FIELD_LEN = 80
+#: Тип и state уже показаны отдельно — не дублируем их в полях.
+_SHOWN_APART = frozenset({"eventtype", "eventstate"})
+PANEL_EVENTS_KEEP = 10
+#: Одна и та же сигнатура пишется в журнал на INFO не чаще раза в 10 минут:
+#: терминал шлёт по несколько событий на каждое лицо/карту/нажатие.
+PANEL_EVENT_INFO_EVERY = 600.0
+
+
+def is_heartbeat(event: dict[str, Any]) -> bool:
+    """Пульс alertStream (videoloss/inactive раз в несколько секунд).
+
+    Если его хранить, он за минуту вытеснит из десяти мест всё полезное.
+    """
+    return event.get("type") == "videoloss" and event.get("state") == "inactive"
+
+
+def panel_event_fields(event: dict[str, Any]) -> dict[str, str]:
+    """Короткие неперсональные поля события — то, по чему видно его код."""
+    out: dict[str, str] = {}
+    for key, value in event.get("fields", {}).items():
+        if key in _SHOWN_APART or any(p in key for p in _PRIVATE_KEY_PARTS):
+            continue
+        value = str(value).strip()
+        if value and len(value) <= MAX_FIELD_LEN:
+            out[key] = value
+    return out
+
+
+def panel_event_signature(event: dict[str, Any]) -> str:
+    fields = event.get("fields", {})
+    return "/".join((
+        event.get("type", ""),
+        fields.get("majoreventtype", ""),
+        fields.get("subeventtype") or fields.get("eventtype", ""),
+    ))
+
+
+class PanelEventLog:
+    """Последние нераспознанные события панели — для атрибута panel_events.
+
+    Зачем: на объекте терминал на нажатие «Вызов» шлёт события, которые мы
+    не узнаём, и без их полей не понять, что распознавать. Журнал HA владелец
+    не читает — атрибут видно прямо в карточке сущности.
+    """
+
+    def __init__(
+        self,
+        keep: int = PANEL_EVENTS_KEEP,
+        info_every: float = PANEL_EVENT_INFO_EVERY,
+    ) -> None:
+        self._items: deque[dict[str, Any]] = deque(maxlen=keep)
+        self._info_every = info_every
+        self._last_info: dict[str, float] = {}
+
+    def add(
+        self, event: dict[str, Any], now: float, stamp: str
+    ) -> tuple[str, bool] | None:
+        """Запомнить событие -> (строка для журнала, писать ли на INFO).
+
+        None — пульс потока, ничего не запомнено.
+        """
+        if is_heartbeat(event):
+            return None
+        item = {
+            "time": stamp,
+            "type": event.get("type", ""),
+            "state": event.get("state", ""),
+            "fields": panel_event_fields(event),
+        }
+        self._items.append(item)
+        sig = panel_event_signature(event)
+        last = self._last_info.get(sig)
+        loud = last is None or now - last >= self._info_every
+        if loud:
+            self._last_info[sig] = now
+            if len(self._last_info) > 256:  # сигнатуры не должны копиться вечно
+                self._last_info = {
+                    k: t for k, t in self._last_info.items()
+                    if now - t < self._info_every
+                }
+        line = " ".join(
+            [f"type={item['type']}", f"state={item['state']}"]
+            + [f"{k}={v}" for k, v in item["fields"].items()]
+        )
+        return line, loud
+
+    @property
+    def items(self) -> list[dict[str, Any]]:
+        """Копия, по порядку прихода: самое свежее — последним."""
+        return [{**i, "fields": dict(i["fields"])} for i in self._items]

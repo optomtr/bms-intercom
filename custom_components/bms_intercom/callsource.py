@@ -17,6 +17,7 @@ from datetime import timedelta
 
 from homeassistant.core import callback
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.util import dt as dt_util
 
 from .const import (
     ALERT_BACKOFF_MAX,
@@ -105,12 +106,14 @@ class CallSourceMixin:
                 async for event in self._client.async_iter_alerts(on_connect=_connected):
                     backoff = ALERT_BACKOFF_START
                     state = call_state_from_event(event)
+                    if state is None:
+                        self._remember_panel_event(event)
+                        continue
                     _LOGGER.debug(
                         "[%s] Событие панели: type=%s state=%s -> %s",
                         self.name, event.get("type"), event.get("state"), state,
                     )
-                    if state is not None:
-                        self._apply_panel_state(state)
+                    self._apply_panel_state(state)
                 _LOGGER.debug("[%s] Поток событий закрыт панелью", self.name)
             except asyncio.CancelledError:
                 raise
@@ -147,6 +150,28 @@ class CallSourceMixin:
                     self._notify()
                     return
             await asyncio.sleep(backoff)
+
+    @callback
+    def _remember_panel_event(self, event: dict) -> None:
+        """Нераспознанное событие — кратко в журнал и в атрибут panel_events.
+
+        Раньше в журнал шли только type/state, и по «accesscontrollerevent
+        active» было не понять, какой код у нажатия «Вызов». Теперь видны
+        все короткие поля (без персональных), а владелец видит последние
+        десять прямо в интерфейсе, без журнала. INFO — раз в 10 минут на
+        сигнатуру, иначе DEBUG: терминал шлёт события на каждое лицо и карту.
+        """
+        got = self.panel_event_log.add(
+            event, time.monotonic(), dt_util.now().isoformat(timespec="seconds")
+        )
+        if got is None:
+            return  # пульс потока
+        line, loud = got
+        _LOGGER.log(
+            logging.INFO if loud else logging.DEBUG,
+            "[%s] Нераспознанное событие панели: %s", self.name, line,
+        )
+        self._notify()
 
     @callback
     def _stream_failed(self, reason: str) -> None:
