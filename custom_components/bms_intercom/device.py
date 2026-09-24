@@ -132,7 +132,9 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
             return "демо"
         if self._test_call:
             return TEST_CALL_SOURCE
-        return "поток событий" if self._use_alert_stream else "опрос callStatus"
+        if not self._use_alert_stream:
+            return "опрос callStatus"
+        return "поток событий + опрос" if self._unsub_poll else "поток событий"
 
     @property
     def signal_supported(self) -> bool | None:
@@ -191,8 +193,9 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
             )
         if self._use_alert_stream:
             self._start_alert_stream()
-        else:
-            self._start_poll()
+        # Опрос — всегда, и при потоке событий: короткий ring терминала доступа
+        # виден только ему (см. callsource). Нет callStatus — опрос сам уйдёт.
+        self._start_poll()
         # Learn the capability profile in the background: which commands the
         # panel has, and whether an ISAPI still image exists at all.
         self.entry.async_create_background_task(

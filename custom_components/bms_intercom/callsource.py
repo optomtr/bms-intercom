@@ -5,8 +5,11 @@ Split out of device.py to keep both readable (and under the project's
 callStatus poller and the call-state machine; BMSIntercomDevice owns the
 config, the actions and the diagnostics.
 
-DS-K1T341AM V3.2.30 has no alertStream at all (404), so on that hardware the
-poller IS the doorbell and runs every second.
+Опрос callStatus идёт ВСЕГДА, параллельно с потоком событий (если у модели
+callStatus есть): кнопка вызова DS-K1T341AM даёт ring лишь на 1–2 с (звонить
+терминалу некуда, он сразу бросает вызов), а в alertStream при этом не
+приходит ничего. Поймать этот ring может только опрос раз в секунду; окно
+звонка (RING_WINDOW_SECONDS) держит поп-ап дальше.
 """
 from __future__ import annotations
 
@@ -61,6 +64,10 @@ RING_WINDOW_SECONDS = 25
 class CallSourceMixin:
     """Event stream / polling half of BMSIntercomDevice."""
 
+    #: У модели нет callStatus (ISAPIUnsupported) — опрос больше не заводим,
+    #: даже когда поток событий упал: он бы только сыпал предупреждениями.
+    _poll_unsupported = False
+
     def _start_alert_stream(self) -> None:
         if self._alert_task is None or self._alert_task.done():
             self._alert_task = self.entry.async_create_background_task(
@@ -68,7 +75,7 @@ class CallSourceMixin:
             )
 
     def _start_poll(self) -> None:
-        if self._unsub_poll is None:
+        if self._unsub_poll is None and not self._poll_unsupported:
             self._unsub_poll = async_track_time_interval(
                 self.hass, self._async_poll, timedelta(seconds=CALL_POLL_INTERVAL)
             )
@@ -77,14 +84,13 @@ class CallSourceMixin:
     async def _async_alert_loop(self) -> None:
         """Keep the alertStream connection up, with reconnect and backoff.
 
-        Until the stream has connected at least once, the callStatus poller
-        runs alongside it, so a visitor is never missed while we find out
-        what this firmware supports. Then:
+        The callStatus poller runs alongside it all the time (see the module
+        docstring: a 1–2 s ring never reaches the stream). Then:
           * 404/405/… on the stream  -> unsupported, remembered in the entry,
             polling only (never asked again after a restart);
           * STREAM_GIVE_UP failures in a row without ever connecting -> keep
             polling for this session (not persisted: the cause is unclear);
-          * the stream connects -> the poller is stopped.
+          * the stream connects -> both sources feed the call state.
         """
         backoff = ALERT_BACKOFF_START
         connected_once = False
@@ -95,10 +101,9 @@ class CallSourceMixin:
             connected_once = True
             failures = 0
             self._set_available(True)
-            if self._unsub_poll is not None:
-                _LOGGER.info("[%s] Поток событий подключён — опрос остановлен", self.name)
-                self._unsub_poll()
-                self._unsub_poll = None
+            # Опрос НЕ останавливаем: до 0.3.2 он гас здесь, и короткий ring
+            # терминала доступа (в поток он не приходит) не видел никто.
+            _LOGGER.debug("[%s] Поток событий подключён, опрос идёт дальше", self.name)
 
         while True:
             try:
@@ -180,8 +185,8 @@ class CallSourceMixin:
 
     @callback
     def _stream_failed(self, reason: str) -> None:
-        """A stream failure. Covered by polling until the stream is proven."""
-        if self._unsub_poll is None:
+        """A stream failure. The poller (if the model has callStatus) covers it."""
+        if self._unsub_poll is None and not self._poll_unsupported:
             _LOGGER.info(
                 "[%s] Поток событий недоступен (%s) — пока опрашиваем callStatus",
                 self.name, reason,
@@ -234,6 +239,7 @@ class CallSourceMixin:
                 "[%s] Опрос статуса вызова недоступен (%s). Состояние вызова "
                 "будет только по потоку событий.", self.name, err,
             )
+            self._poll_unsupported = True
             if self._unsub_poll is not None:
                 self._unsub_poll()
                 self._unsub_poll = None
