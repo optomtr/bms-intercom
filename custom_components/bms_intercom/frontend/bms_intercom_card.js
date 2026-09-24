@@ -96,6 +96,7 @@
       if (a.intercom_role) g.roles[a.intercom_role] = st.entity_id;
       if (a.intercom_https_base) g.httpsBase = a.intercom_https_base;
       if (a.intercom_https_port) g.httpsPort = a.intercom_https_port;
+      if (a.talk_supported) g.talkSupported = a.talk_supported;
       if (a.intercom_role === "call") {
         g.callState = a.call_state || (st.state === "on" ? "ringing" : "idle");
       }
@@ -185,7 +186,9 @@
           max-width: 86%; background: #20283a; color: #eaf0f8; border: 1px solid #3a4660; border-radius: 14px;
           padding: 11px 16px; font-size: 14px; line-height: 1.35; text-align: center;
           box-shadow: 0 8px 26px rgba(0,0,0,.55); opacity: 0; pointer-events: none; transition: opacity .2s; }
-        .bms-toast.show { opacity: 1; }
+        /* Показанный тост ловит клики: иначе ссылка «Открыть по HTTPS» в нём
+           не нажималась (pointer-events: none наследовался и от .show). */
+        .bms-toast.show { opacity: 1; pointer-events: auto; }
       </style>
       <div class="bms-card" data-mode="ringing">
         <div class="bms-ph">${svg("camera")}</div>
@@ -254,7 +257,8 @@
     if (entity) hass.callService("button", "press", { entity_id: entity });
     if (role === "answer") {
       setMuted(false);   // звук панели всегда включён в разговоре
-      startMic(true);    // микрофон оператора включён по умолчанию (тихо)
+      if (talkUnsupported(g)) noteListenOnly();
+      else startMic(true); // микрофон оператора включён по умолчанию (тихо)
     } else if (role === "open_door") {
       // Открытие двери завершает вызов автоматически.
       if (currentMode === "ringing" || currentMode === "talk") {
@@ -273,6 +277,21 @@
     }
   }
 
+  // Терминал без two-way audio по ISAPI (DS-K1T341AM: talk_supported=no):
+  // микрофон не захватываем и не зовём talk_start — голос всё равно не дойдёт,
+  // а тост «откройте по HTTPS» только сбивал бы с толку.
+  function talkUnsupported(g) { return !!g && g.talkSupported === "no"; }
+  let listenOnlyNoted = false;
+  function noteListenOnly() {
+    if (listenOnlyNoted) return; // один раз за загрузку страницы, не на каждый звонок
+    listenOnlyNoted = true;
+    showToast("Терминал не принимает голос с HA — только слушать");
+  }
+  function applyTalkSupport(g) {
+    const btn = overlay && overlay.querySelector(".bms-mic");
+    if (btn) btn.classList.toggle("bms-hidden", talkUnsupported(g));
+  }
+
   function clearAutoEnd() {
     if (autoEndTimer) { clearTimeout(autoEndTimer); autoEndTimer = null; }
   }
@@ -285,7 +304,11 @@
     if (link) {
       const a = document.createElement("a");
       a.href = link; a.textContent = "Открыть по HTTPS";
+      a.target = "_self"; // та же вкладка: киоск не должен плодить окна
       a.style.cssText = "display:inline-block;margin-top:8px;color:#7db1ff;font-weight:700;text-decoration:none;";
+      // Клик — только ссылке: не всплывает к оверлею/документу, где его мог
+      // перехватить обработчик поп-апа или навигация фронтенда HA.
+      a.addEventListener("click", (e) => e.stopPropagation());
       t.appendChild(document.createElement("br")); t.appendChild(a);
     }
     t.classList.add("show");
@@ -438,6 +461,7 @@
   }
 
   async function toggleMic() {
+    if (talkUnsupported(currentGroup())) { stopMic(); updateMicBtn(); return; }
     if (micOn) stopMic(); else await startMic();
     updateMicBtn();
   }
@@ -669,6 +693,8 @@
       }
     }
     if (!pick) { if (lastSig !== null) hide(); return; }
+    // Вердикт talk_supported может прийти посреди звонка — кнопку правим всегда.
+    applyTalkSupport(pick[1]);
 
     const sig = `${pickMode}:${pick[0]}`;
     if (sig === lastSig) {
@@ -715,7 +741,7 @@
   });
 
   if (window.__BMS_INTERCOM_TEST__) {
-    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick };
+    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick, callRole };
   }
 
   // eslint-disable-next-line no-console

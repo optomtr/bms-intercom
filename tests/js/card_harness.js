@@ -11,21 +11,38 @@ const src = fs.readFileSync(
   path.join(__dirname, "..", "..", "custom_components", "bms_intercom",
             "frontend", "bms_intercom_card.js"), "utf8");
 
+// Элемент помнит своё состояние: классы и потомков по селектору (один и тот
+// же querySelector отдаёт один и тот же объект) — иначе не проверить, что
+// кнопка «Микрофон» спрятана.
+const created = [];
 function fakeElement() {
+  const classes = new Set();
+  const kids = {};
   const el = {
     style: {}, dataset: {}, innerHTML: "", textContent: "", className: "",
-    title: "", src: "",
-    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-    querySelector() { return fakeElement(); },
+    title: "", src: "", kids,
+    classList: {
+      add(c) { classes.add(c); },
+      remove(c) { classes.delete(c); },
+      toggle(c, force) {
+        const on = force === undefined ? !classes.has(c) : !!force;
+        if (on) classes.add(c); else classes.delete(c);
+        return on;
+      },
+      contains(c) { return classes.has(c); },
+    },
+    querySelector(sel) { return kids[sel] || (kids[sel] = fakeElement()); },
     querySelectorAll() { return []; },
     addEventListener() {}, appendChild() {}, setAttribute() {},
     getAttribute() { return null; }, removeAttribute() {}, load() {},
     play() { return Promise.resolve(); }, pause() {},
   };
+  created.push(el);
   return el;
 }
 
 let homeAssistant = null;
+let gumCalls = 0;
 const warnings = [];
 const errors = [];
 const sandbox = {
@@ -39,8 +56,13 @@ const sandbox = {
   HTMLElement: class {},
   Audio: function () { return fakeElement(); },
   setInterval() { return 1; },
+  setTimeout() { return 1; }, clearTimeout() {},
   location: { protocol: "http:", hostname: "ha.local", port: "8123" },
-  navigator: {},
+  navigator: {
+    mediaDevices: {
+      getUserMedia() { gumCalls += 1; return new Promise(() => {}); },  // висит
+    },
+  },
   console: {
     info() {}, debug() {}, log() {},
     warn(...a) { warnings.push(String(a[0])); },
@@ -88,6 +110,53 @@ attempt("ringing_tick_without_camera_token", () => { api.tick(); return "ok"; })
 // 6. safeTick never throws, even on a hostile hass
 homeAssistant = { get hass() { throw new Error("boom"); } };
 attempt("safe_tick_swallows", () => { api.safeTick(); api.safeTick(); return "ok"; });
+
+// 7. Показанный тост ловит клики (ссылка «Открыть по HTTPS» нажимается).
+const overlayEl = () => created.find((e) => e.id === "bms-intercom-overlay");
+attempt("toast_show_takes_clicks", () =>
+  /\.bms-toast\.show\s*\{[^}]*pointer-events:\s*auto/.test(overlayEl().innerHTML));
+
+// 8. Терминал без two-way audio (talk_supported=no): в разговоре кнопки
+// «Микрофон» нет, «Ответить» не трогает микрофон и talk_start, тост — один раз.
+function talking(id, talk) {
+  const sent = [];
+  const hass = {
+    states: {
+      [`binary_sensor.${id}_vyzov`]: { entity_id: `binary_sensor.${id}_vyzov`, state: "on",
+        attributes: { intercom_id: id, intercom_name: "Терминал", intercom_role: "call",
+                      call_state: "answered", talk_supported: talk } },
+      [`button.${id}_answer`]: { entity_id: `button.${id}_answer`, state: "unknown",
+        attributes: { intercom_id: id, intercom_role: "answer", talk_supported: talk } },
+    },
+    callService() {},
+    connection: { sendMessagePromise(m) { sent.push(m.type); return new Promise(() => {}); } },
+  };
+  homeAssistant = { hass };
+  return sent;
+}
+const micHidden = () => overlayEl().kids[".bms-mic"].classList.contains("bms-hidden");
+const toast = () => overlayEl().kids[".bms-toast"];
+attempt("talk_no", () => {
+  const sent = talking("e2", "no");
+  api.tick();
+  const hidden = micHidden();
+  const gum0 = gumCalls;
+  api.callRole("answer");
+  const first = toast().textContent;
+  toast().textContent = "";
+  api.callRole("answer");
+  return { hidden, gum: gumCalls - gum0, talkStart: sent.includes("bms_intercom/talk_start"),
+           first, second: toast().textContent };
+});
+// Контроль: модель с two-way audio — кнопка есть, микрофон захватывается.
+attempt("talk_yes", () => {
+  talking("e3", "yes");
+  api.tick();
+  const hidden = micHidden();
+  const gum0 = gumCalls;
+  api.callRole("answer");
+  return { hidden, gum: gumCalls - gum0 };
+});
 
 out.warnings = warnings.length;
 out.errors = errors.length;

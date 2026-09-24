@@ -56,6 +56,23 @@ class TestPopupCard(unittest.TestCase):
     def test_camera_without_token_yet(self):
         self.assertSurvives("ringing_tick_without_camera_token")
 
+    def test_shown_toast_takes_clicks(self):
+        """0.3.3: ссылка «Открыть по HTTPS» в тосте не нажималась."""
+        self.assertTrue(self.assertSurvives("toast_show_takes_clicks"))
+
+    def test_terminal_without_two_way_audio_has_no_mic(self):
+        """0.3.3, DS-K1T341AM: talk_supported=no → нет «Микрофона», нет захвата."""
+        got = self.assertSurvives("talk_no")
+        self.assertTrue(got["hidden"], "кнопка «Микрофон» видна")
+        self.assertEqual(got["gum"], 0, "getUserMedia вызван")
+        self.assertFalse(got["talkStart"], "talk_start отправлен")
+        self.assertEqual(got["first"], "Терминал не принимает голос с HA — только слушать")
+        self.assertEqual(got["second"], "", "тост повторяется на каждый ответ")
+
+    def test_terminal_with_two_way_audio_keeps_the_mic(self):
+        """Контроль к предыдущему: та же проверка видит работающий микрофон."""
+        self.assertEqual(self.assertSurvives("talk_yes"), {"hidden": False, "gum": 1})
+
     def test_a_failing_tick_is_logged_once_not_every_400ms(self):
         self.assertSurvives("safe_tick_swallows")
         self.assertEqual(self.out["warnings"], 1)
