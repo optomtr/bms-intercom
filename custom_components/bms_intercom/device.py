@@ -355,20 +355,21 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
     async def async_reject(self) -> None:
         """Отклонить звонящий вызов или положить трубку в разговоре.
 
-        Из форка: панель завершает отвеченный вызов командой `hangUp`, а ещё
-        звонящий — `reject`. Шлём подходящую по состоянию, при отказе — другую.
+        ВСЕГДА обе команды, reject → hangUp, не до первой принятой: живой
+        терминал на hangUp после ответа говорит 200, но экран «звоню» гасит
+        только reject (0.3.3). Лишняя команда безвредна, недосланная — нет.
         """
-        answered = self.call_state == STATE_ANSWERED
-        cmds = ("hangUp", "reject") if answered else ("reject", "hangUp")
-        await self._async_call_signal(cmds, STATE_IDLE)
+        await self._async_call_signal(("reject", "hangUp"), STATE_IDLE, send_all=True)
 
-    async def _async_call_signal(self, cmds: tuple[str, ...], new_state: str) -> None:
+    async def _async_call_signal(
+        self, cmds: tuple[str, ...], new_state: str, *, send_all: bool = False
+    ) -> None:
         """Send answer/reject where the model has it; otherwise stay local.
 
-        Commands are tried in order until one is accepted. DS-K1T341AM has no
-        callSignal endpoint: the buttons then only move the local call state
-        (the popup and the door relay still work), and the entity attributes
-        say `answer_supported: no` so nobody is misled.
+        Commands go in order until one is accepted; send_all sends every one
+        (a failed one never stops the next; failed = all refused). DS-K1T341AM
+        has no callSignal: the buttons then only move the local call state
+        (popup and door relay still work), and `answer_supported: no` says so.
         """
         word = "принят" if new_state == STATE_ANSWERED else "сброшен"
         if self.is_demo:
@@ -379,18 +380,20 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
             _LOGGER.info("[%s] Тестовый вызов %s — панели не шлём", self.name, word)
         elif self._client is not None:
             errors: list[ISAPIError] = []
+            accepted = False
             for cmd in cmds:
                 try:
-                    if await self._client.async_signal(cmd):
-                        break
+                    accepted = await self._client.async_signal(cmd) or accepted
                 except ISAPIError as err:
                     errors.append(err)
                     _LOGGER.warning("[%s] Команда «%s» не прошла: %s", self.name, cmd, err)
-            else:
-                if len(errors) == len(cmds):
-                    _LOGGER.error("[%s] Вызов не %s: панель отвергла все команды", self.name, word)
-                    self._set_available(False, str(errors[-1]))
-                    return
+                if accepted and not send_all:
+                    break
+            if len(errors) == len(cmds):
+                _LOGGER.error("[%s] Вызов не %s: панель отвергла все команды", self.name, word)
+                self._set_available(False, str(errors[-1]))
+                return
+            if not accepted:
                 _LOGGER.debug(
                     "[%s] У модели нет команд %s — меняем только состояние "
                     "в Home Assistant", self.name, "/".join(cmds),
