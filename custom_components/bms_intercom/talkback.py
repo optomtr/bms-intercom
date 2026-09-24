@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import re
+from urllib.parse import quote
 
 import httpx
 
@@ -126,6 +127,19 @@ class TwoWayAudioError(Exception):
     """Сбой ISAPI two-way audio (сокет не открылся или оборвался)."""
 
 
+class TwoWayAudioUnsupported(TwoWayAudioError):
+    """Модель вовсе не принимает звук по ISAPI (DS-K1T341AM: 404 notSupport)."""
+
+
+#: Текст для журнала и для вердикта talk_supported — один на все случаи.
+UNSUPPORTED_TEXT = "панель не поддерживает двусторонний звук по ISAPI"
+
+
+def _not_supported(status: int, body: str) -> bool:
+    """404/501 или notSupport в теле — у модели нет two-way audio совсем."""
+    return status in (404, 501) or "<subStatusCode>notSupport<" in (body or "")
+
+
 class TwoWayAudioSession:
     """Шлёт сырой G.711 на панель через ISAPI two-way audio."""
 
@@ -152,6 +166,10 @@ class TwoWayAudioSession:
         """Найти канал, (пере)открыть его и открыть сокет audioData."""
         resp = await self._req("GET", "/ISAPI/System/TwoWayAudio/channels")
         xml = resp.text
+        # Без этой проверки DS-K1T341AM (404 notSupport) доходил до audioData и
+        # падал невнятным «audioData HTTP 400» — теперь внятный отказ сразу.
+        if _not_supported(resp.status_code, xml):
+            raise TwoWayAudioUnsupported(UNSUPPORTED_TEXT)
         self._channel = between(xml, "<id>", "<") or "1"
         self.codec = between(xml, "<audioCompressionType>", "<") or "G.711ulaw"
 
@@ -162,9 +180,15 @@ class TwoWayAudioSession:
             await self._req("PUT", base + "/close")
         except httpx.HTTPError:
             pass
-        await self._req("PUT", base + "/open")
+        opened = await self._req("PUT", base + "/open")
+        if _not_supported(opened.status_code, opened.text):
+            raise TwoWayAudioUnsupported(UNSUPPORTED_TEXT)
+        # Новые прошивки отвечают на open <sessionId> и без него в audioData
+        # дают 400. Старые (DS-KV6113, go2rtc) его не присылают — путь без query.
+        session = (between(opened.text, "<sessionId>", "<") or "").strip()
+        audio = base + "/audioData" + (f"?sessionId={quote(session, safe='')}" if session else "")
 
-        self._writer = await self._open_audio_socket(base + "/audioData")
+        self._writer = await self._open_audio_socket(audio)
         _LOGGER.debug(
             "ISAPI two-way audio открыт: канал %s, кодек %s", self._channel, self.codec
         )

@@ -151,6 +151,8 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         self.snapshot_supported: bool | None = None
         self.call_signal_supported: bool | None = None
         self.alert_stream_supported: bool | None = None
+        #: Двусторонний звук (микрофон оператора → панель) по ISAPI.
+        self.talk_supported: bool | None = None
         self.capabilities_raw: str = ""
         # Filled by async_probe(): extra report sections and the event log.
         self.probe_sections: list[str] = []
@@ -374,11 +376,25 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
         """Best-effort: кодек two-way audio панели = G.711 µ-law (из форка).
 
         Браузер шлёт G.711 µ-law (talkback.py); совпадение с панелью избавляет
-        от перекодирования. Уже стоит — ничего не делаем. Модель без
-        two-way audio (DS-K1T341AM) отвечает 404 — ISAPIError ловит вызывающий.
+        от перекодирования. Уже стоит — ничего не делаем.
+
+        Заодно выясняет talk_supported: DS-K1T341AM V3.2.30 отвечает на список
+        каналов 404 notSupport — голос с HA на него не передать, и поп-ап не
+        должен выдавать «Микрофон» за рабочий. Прочие сбои (нет связи, 401)
+        вердикта не дают: talk_supported остаётся None, ISAPIError — наверх.
         """
         base = "/ISAPI/System/TwoWayAudio/channels"
-        resp = await self._request(Call("twoWayAudio.channels", "GET", base))
+        resp = await self._send("GET", base)
+        if not status_ok(resp.status_code) and (
+            resp.status_code in (404, 501) or refusal_word(resp.text) == "notSupport"
+        ):
+            self.talk_supported = False
+            _LOGGER.info("Панель не поддерживает двусторонний звук по ISAPI (HTTP %s)",
+                         resp.status_code)
+            return
+        if not status_ok(resp.status_code):
+            raise ISAPIError(f"GET {base}: HTTP {resp.status_code}")
+        self.talk_supported = True
         cid = between(resp.text, "<id>", "<") or "1"
         if between(resp.text, "<audioCompressionType>", "<") == codec:
             return
