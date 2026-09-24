@@ -42,11 +42,12 @@ from .callsource import (
 from .isapi import ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
 from .talkback import TwoWayAudioError, TwoWayAudioSession
+from .testcall import TEST_CALL_SOURCE, CallTestMixin
 
 _LOGGER = logging.getLogger(__name__)
 
 
-class BMSIntercomDevice(CallSourceMixin):
+class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
     """Holds the call state and exposes the actions the UI can trigger.
 
     In demo mode the actions only update local state so the whole flow can be
@@ -126,6 +127,8 @@ class BMSIntercomDevice(CallSourceMixin):
         """Where the call state comes from on this panel."""
         if self.is_demo:
             return "демо"
+        if self._test_call:
+            return TEST_CALL_SOURCE
         return "поток событий" if self._use_alert_stream else "опрос callStatus"
 
     @property
@@ -342,6 +345,10 @@ class BMSIntercomDevice(CallSourceMixin):
         word = "принят" if new_state == STATE_ANSWERED else "сброшен"
         if self.is_demo:
             _LOGGER.info("[%s] Вызов %s (демо)", self.name, word)
+        elif self._test_call:
+            # Запасной тестовый вызов: на панели звонка нет, callSignal ушёл бы
+            # в пустоту (или сбросил бы чужой разговор) — меняем только HA.
+            _LOGGER.info("[%s] Тестовый вызов %s — панели не шлём", self.name, word)
         elif self._client is not None:
             errors: list[ISAPIError] = []
             for cmd in cmds:

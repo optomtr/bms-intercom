@@ -39,4 +39,8 @@ class CallBinarySensor(BMSIntercomEntity, BinarySensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        return {**self.intercom_attributes, "call_state": self.device.call_state}
+        attrs = {**self.intercom_attributes, "call_state": self.device.call_state}
+        if self.device.test_call_result:
+            # Итог «Тестового звонка» — и здесь, рядом с самим вызовом.
+            attrs["test_call_result"] = self.device.test_call_result
+        return attrs

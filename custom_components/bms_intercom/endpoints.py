@@ -155,6 +155,80 @@ def call_signal_calls(cmd: str) -> tuple[Call, ...]:
     )
 
 
+def key_cfg_calls() -> tuple[Call, ...]:
+    """Куда звонит кнопка вызова панели (keyCfg/1: callNumber = номер комнаты).
+
+    Нужен «Тестовому звонку»: просим панель позвонить туда же, куда звонит
+    настоящая кнопка. Не прочиталось — адресат по умолчанию (комната 1).
+    """
+    base = "/ISAPI/VideoIntercom/keyCfg/1"
+    return (
+        Call("keyCfg.1.json", "GET", f"{base}?format=json"),
+        Call("keyCfg.1.xml", "GET", base),
+    )
+
+
+def call_request_calls(room: int = 1) -> tuple[Call, ...]:
+    """Попросить панель начать вызов, будто посетитель нажал кнопку.
+
+    `cmdType: request` («запрос вызова») — из того же словаря callSignal, что
+    answer/reject/hangUp (Hikvision ISAPI VideoIntercom). Адресат — внутренний
+    монитор (`unitType: indoor`) с номером комнаты кнопки. Прошивки разнятся,
+    поэтому сначала полная форма, затем без адресата, затем XML.
+    """
+    path = "/ISAPI/VideoIntercom/callSignal"
+    target_json = '{"unitType": "indoor", "roomNumber": %d}' % room
+    target_xml = f"<target><unitType>indoor</unitType><roomNumber>{room}</roomNumber></target>"
+    return (
+        Call(
+            "callSignal.request.target.json", "PUT", f"{path}?format=json",
+            '{"CallSignal": {"cmdType": "request", "target": %s}}' % target_json,
+            JSON_CT,
+        ),
+        Call(
+            "callSignal.request.json", "PUT", f"{path}?format=json",
+            '{"CallSignal": {"cmdType": "request"}}', JSON_CT,
+        ),
+        Call(
+            "callSignal.request.xml", "PUT", path,
+            f"<CallSignal><cmdType>request</cmdType>{target_xml}</CallSignal>",
+            XML_CT,
+        ),
+    )
+
+
+_CALL_NUMBER = re.compile(r'(?i)(?:callNumber|roomNumber)"?\s*[:>]\s*"?(\d{1,6})(?!\d)')
+# (?<![a-z]) — не спутать с subStatusCode.
+_STATUS_CODE = re.compile(r'(?i)(?<![a-z])statusCode"?\s*[:>]\s*"?(\d+)')
+_REFUSAL = tuple(
+    re.compile(r'(?i)%s"?\s*[:>]\s*"?([A-Za-z]\w*)' % key)
+    for key in ("errorMsg", "subStatusCode")
+)
+
+
+def parse_call_number(text: str | None) -> int | None:
+    """Номер комнаты из keyCfg (JSON или XML); None — не нашли."""
+    match = _CALL_NUMBER.search(text or "")
+    return int(match.group(1)) if match and int(match.group(1)) > 0 else None
+
+
+def body_ok(text: str | None) -> bool:
+    """HTTP 200 ещё не «да»: Hikvision кладёт отказ в тело (statusCode 4 …).
+
+    Нет statusCode в теле — судим по HTTP; есть — годится только 1 (OK).
+    """
+    match = _STATUS_CODE.search(text or "")
+    return match is None or match.group(1) == "1"
+
+
+def refusal_word(text: str | None) -> str:
+    """Короткая причина отказа из тела (notSupport, noRequest…) для журнала."""
+    for pattern in _REFUSAL:
+        if match := pattern.search(text or ""):
+            return match.group(1)
+    return ""
+
+
 #: Capability document; tells us whether answer/reject exist on this model.
 VIDEO_INTERCOM_CAPABILITIES = "/ISAPI/VideoIntercom/capabilities?format=json"
 

@@ -228,6 +228,18 @@ class CallSourceMixin:
         Действия оператора в HA идут мимо — прямо в _apply_call_state.
         """
         now = time.monotonic()
+        if self._test_call:
+            # Запасной тестовый вызов (testcall.py) живёт только в HA: у панели
+            # звонка нет, и опрос каждую секунду честно говорит idle. Это idle
+            # тест не гасит — гасят «Сбросить», таймер вызова или истёкший срок
+            # _test_call_until (на случай, если таймер сняла пропажа связи).
+            # А ringing/answered от панели — настоящий звонок: он вытесняет тест.
+            if new_state == STATE_IDLE:
+                if now < self._test_call_until:
+                    return
+            else:
+                self._ringing_at = now
+            self._test_call = False
         if self._answered:
             if now - self._answered_at <= MAX_TALK_SECONDS:
                 return  # латч разговора: статус панели не закрывает поп-ап
@@ -245,6 +257,8 @@ class CallSourceMixin:
 
     @callback
     def _apply_call_state(self, new_state: str) -> None:
+        if new_state == STATE_IDLE:
+            self._test_call = False  # вызов кончился — кончился и тест
         if new_state == self.call_state:
             if new_state != STATE_IDLE:
                 self._arm_call_timeout()  # keep the safety net fresh
@@ -278,6 +292,7 @@ class CallSourceMixin:
         def _expire(_now) -> None:
             self._unsub_call_timeout = None
             self._answered = False
+            self._test_call = False
             if self.call_state != STATE_IDLE:
                 _LOGGER.info(
                     "[%s] Вызов сброшен по таймауту (%s с)", self.name, timeout

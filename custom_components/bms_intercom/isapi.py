@@ -24,12 +24,17 @@ from .endpoints import (
     Call,
     DEFAULT_CHANNEL,
     alert_stream_paths,
+    body_ok,
+    call_request_calls,
     call_signal_calls,
     call_status_calls,
     capability_calls,
     door_calls,
     identity_calls,
+    key_cfg_calls,
+    parse_call_number,
     redact,
+    refusal_word,
     rtsp_paths,
     rtsp_url,
     select_first_working,
@@ -327,6 +332,39 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
             )
             return False
         raise ISAPIError(f"{cmd}: HTTP {last_status}")
+
+    async def async_request_call(self) -> tuple[bool, str]:
+        """«Тестовый звонок»: попросить панель позвонить, будто нажата кнопка.
+
+        Возвращает (панель приняла?, пояснение для владельца). Принятым
+        считается только HTTP 2xx без отказа в теле (statusCode ≠ 1 = отказ).
+        Отказ здесь НЕ выключает ответ/сброс: `request` — отдельная команда,
+        модель может уметь answer/reject и не уметь request.
+        Сетевая ошибка (панель молчит) поднимается как ISAPIError.
+        """
+        if self.call_signal_supported is False:
+            return False, "у модели нет callSignal"
+        room = 1
+        for call in key_cfg_calls():
+            resp = await self._send(call.method, call.path)
+            if status_ok(resp.status_code):
+                room = parse_call_number(resp.text) or 1
+                break
+        refusals: list[str] = []
+        for call in call_request_calls(room):
+            resp = await self._send(
+                call.method, call.path, body=call.body, headers=call.headers or None
+            )
+            _LOGGER.debug(
+                "ISAPI %s -> %s %s", call.name, resp.status_code,
+                redact(resp.text[:200], *self.secrets),
+            )
+            if status_ok(resp.status_code) and body_ok(resp.text):
+                return True, f"панель приняла {call.name}, комната {room}"
+            refusals.append(
+                f"{call.name}: HTTP {resp.status_code} {refusal_word(resp.text)}".strip()
+            )
+        return False, "панель отказала (" + "; ".join(refusals) + ")"
 
     async def async_open_door(self) -> None:
         """Open the door relay using whichever shape this model accepts."""

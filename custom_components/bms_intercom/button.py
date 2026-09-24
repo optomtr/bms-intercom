@@ -29,7 +29,37 @@ async def async_setup_entry(
     # The "simulate call" button only makes sense without real hardware.
     if device.is_demo:
         entities.append(SimulateCallButton(device))
+    else:
+        entities.append(TestCallButton(device))
     async_add_entities(entities)
+
+
+class TestCallButton(BMSIntercomEntity, ButtonEntity):
+    """Проверить звонок, не выходя на улицу к кнопке вызова (реальный режим).
+
+    Сначала просит панель позвонить по-настоящему, не вышло — запасной
+    тестовый вызов с живым видео (testcall.py). Что именно произошло — в
+    атрибуте `test_call_result`: владелец видит это без журнала.
+    """
+
+    _attr_name = "Тестовый звонок"
+    _attr_translation_key = "test_call"
+    _attr_icon = "mdi:phone-ring-outline"
+    _attr_entity_category = EntityCategory.CONFIG
+    _intercom_role = "test_call"
+
+    def __init__(self, device: BMSIntercomDevice) -> None:
+        super().__init__(device, "test_call")
+
+    async def async_press(self) -> None:
+        await self.device.async_test_call()
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        return {
+            **self.intercom_attributes,
+            "test_call_result": self.device.test_call_result,
+        }
 
 
 class SimulateCallButton(BMSIntercomEntity, ButtonEntity):
