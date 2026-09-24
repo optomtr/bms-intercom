@@ -46,6 +46,16 @@ STATE_ANSWERED = "answered"
 #: What ISAPIClient.async_get_call_status() may return besides None (unknown).
 _KNOWN_STATES = frozenset({STATE_IDLE, STATE_RINGING, STATE_ANSWERED})
 
+# Две поправки из форка (Abdunazar7, проверены на DS-KV6113):
+#: После «Ответить» в HA держим разговор до «Сбросить» или столько секунд,
+#: что бы ни рапортовала панель: вилла-панель быстро говорит idle (она звонит
+#: мониторам / Hik-Connect, а не HA), а звук и видео идут мимо её статуса.
+MAX_TALK_SECONDS = 180
+#: Начавшийся звонок держим хотя бы столько секунд, даже если панель бросила
+#: вызов через секунду (нет интернета → не достучалась до Hik-Connect):
+#: оператор должен успеть увидеть поп-ап и ответить.
+RING_WINDOW_SECONDS = 25
+
 
 class CallSourceMixin:
     """Event stream / polling half of BMSIntercomDevice."""
@@ -100,7 +110,7 @@ class CallSourceMixin:
                         self.name, event.get("type"), event.get("state"), state,
                     )
                     if state is not None:
-                        self._apply_call_state(state)
+                        self._apply_panel_state(state)
                 _LOGGER.debug("[%s] Поток событий закрыт панелью", self.name)
             except asyncio.CancelledError:
                 raise
@@ -208,9 +218,31 @@ class CallSourceMixin:
         if raw is None:
             return  # unknown word from the panel: keep the state we had
         if raw in _KNOWN_STATES:
-            self._apply_call_state(raw)
+            self._apply_panel_state(raw)
 
     # --- call state --------------------------------------------------------
+    @callback
+    def _apply_panel_state(self, new_state: str) -> None:
+        """Статус, который сообщила ПАНЕЛЬ (опрос или поток событий).
+
+        Действия оператора в HA идут мимо — прямо в _apply_call_state.
+        """
+        now = time.monotonic()
+        if self._answered:
+            if now - self._answered_at <= MAX_TALK_SECONDS:
+                return  # латч разговора: статус панели не закрывает поп-ап
+            self._answered = False
+        if new_state == STATE_RINGING and self.call_state != STATE_RINGING:
+            self._ringing_at = now
+        if self.call_state == STATE_RINGING and new_state == STATE_IDLE:
+            left = RING_WINDOW_SECONDS - (now - self._ringing_at)
+            if left > 0:
+                # Окно звонка. Сброс поручаем таймеру вызова: с опросом его и так
+                # сделает следующий опрос, а поток событий второго idle не пришлёт.
+                self._arm_call_timeout(left)
+                return
+        self._apply_call_state(new_state)
+
     @callback
     def _apply_call_state(self, new_state: str) -> None:
         if new_state == self.call_state:
@@ -228,16 +260,24 @@ class CallSourceMixin:
         self._notify()
 
     @callback
-    def _arm_call_timeout(self) -> None:
-        """A call that never gets an end event must not hang forever."""
+    def _arm_call_timeout(self, seconds: float | None = None) -> None:
+        """A call that never gets an end event must not hang forever.
+
+        Пока держится латч разговора, срок — не меньше MAX_TALK_SECONDS:
+        иначе обычный таймаут (60 с) оборвал бы разговор, который латч
+        как раз должен держать.
+        """
         self._cancel_call_timeout()
-        timeout = self.call_timeout
+        timeout = self.call_timeout if seconds is None else seconds
         if timeout <= 0:
             return
+        if seconds is None and self._answered:
+            timeout = max(timeout, MAX_TALK_SECONDS)
 
         @callback
         def _expire(_now) -> None:
             self._unsub_call_timeout = None
+            self._answered = False
             if self.call_state != STATE_IDLE:
                 _LOGGER.info(
                     "[%s] Вызов сброшен по таймауту (%s с)", self.name, timeout

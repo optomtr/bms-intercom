@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -40,6 +41,7 @@ from .callsource import (
 )
 from .isapi import ISAPIClient, ISAPIError
 from .probe import format_probe_report, report_attributes
+from .talkback import TwoWayAudioError, TwoWayAudioSession
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -72,6 +74,15 @@ class BMSIntercomDevice(CallSourceMixin):
         self._alert_task: asyncio.Task | None = None
         self._use_alert_stream: bool = True
         self._poll_blocked_until: float = 0.0
+        # Из форка: idle-просмотр (переключатель «Просмотр»), микрофон к панели,
+        # латч разговора и окно звонка (см. callsource._apply_panel_state).
+        self.view_active: bool = False
+        self._talk: TwoWayAudioSession | None = None
+        self._talk_bytes = 0
+        self._talk_logged_at = 0
+        self._answered = False
+        self._answered_at = 0.0
+        self._ringing_at = 0.0
 
     # --- options -----------------------------------------------------------
     def _opt(self, key: str, default):
@@ -195,9 +206,17 @@ class BMSIntercomDevice(CallSourceMixin):
             return
         self._set_available(True)
         self._notify()
+        # Авто-настройка из форка: кодек two-way audio = G.711, чтобы микрофон
+        # браузера доходил без перекодирования. Здесь, а не в async_setup:
+        # недоступная панель не должна задерживать запуск интеграции.
+        try:
+            await self._client.async_ensure_twoway_codec()
+        except ISAPIError as err:
+            _LOGGER.debug("[%s] Кодек two-way audio не задан: %s", self.name, err)
 
     async def async_shutdown(self) -> None:
         """Stop the listener/poller and close the ISAPI client."""
+        await self.async_talk_stop()
         if self._unsub_poll is not None:
             self._unsub_poll()
             self._unsub_poll = None
@@ -236,7 +255,63 @@ class BMSIntercomDevice(CallSourceMixin):
                 self._cancel_call_timeout()
             self._notify()
 
+    # --- Микрофон оператора → панель (native ISAPI two-way audio) ----------
+    async def async_talk_start(self) -> None:
+        """Открыть канал two-way audio панели под микрофон оператора."""
+        if self.is_demo:
+            return
+        host = self.entry.data.get(CONF_HOST)
+        if not host:
+            return
+        # Закрываем прошлую сессию (вкладку закрыли без talk_stop) — иначе к
+        # панели останется висеть two-way-сокет и новый не откроется.
+        await self.async_talk_stop()
+        sess = TwoWayAudioSession(
+            host,
+            self._opt(CONF_HTTP_PORT, DEFAULT_HTTP_PORT),
+            self.entry.data.get(CONF_USERNAME, ""),
+            self.entry.data.get(CONF_PASSWORD, ""),
+        )
+        try:
+            await sess.async_open()
+        except Exception as err:  # noqa: BLE001 - микрофон не должен ронять HA
+            _LOGGER.warning("[%s] Не удалось открыть микрофон к панели: %s", self.name, err)
+            await sess.async_close()
+            return
+        self._talk = sess
+        self._talk_bytes = 0
+        self._talk_logged_at = 0
+        _LOGGER.debug("[%s] Микрофон к панели открыт (кодек %s)", self.name, sess.codec)
+
+    async def async_talk_send(self, data: bytes) -> None:
+        """Передать кусок G.711 от браузера на панель."""
+        if self._talk is None:
+            return
+        try:
+            await self._talk.async_send(data)
+        except TwoWayAudioError as err:
+            _LOGGER.warning("[%s] Микрофон: поток к панели оборвался (%s)", self.name, err)
+            await self.async_talk_stop()
+            return
+        # Раз в ~2 с (16000 байт при 8 кГц) отметить в debug, что звук уходит.
+        self._talk_bytes += len(data)
+        if self._talk_bytes - self._talk_logged_at >= 16000:
+            self._talk_logged_at = self._talk_bytes
+            _LOGGER.debug("[%s] Микрофон → панель: отправлено %d Б", self.name, self._talk_bytes)
+
+    async def async_talk_stop(self) -> None:
+        """Закрыть канал two-way audio панели."""
+        sess, self._talk = self._talk, None
+        if sess is not None:
+            await sess.async_close()
+
     # --- Actions -----------------------------------------------------------
+    async def async_set_view(self, on: bool) -> None:
+        """Открыть/закрыть idle-просмотр (поп-ап без вызова)."""
+        if self.view_active != on:
+            self.view_active = on
+            self._notify()
+
     async def async_simulate_call(self) -> None:
         """Demo only: pretend the panel started ringing."""
         _LOGGER.info("[%s] Симуляция входящего вызова", self.name)
@@ -244,35 +319,53 @@ class BMSIntercomDevice(CallSourceMixin):
 
     async def async_answer(self) -> None:
         """Answer the call (pick up the handset)."""
-        await self._async_call_signal("answer", STATE_ANSWERED)
+        await self._async_call_signal(("answer",), STATE_ANSWERED)
 
     async def async_reject(self) -> None:
-        """Reject / hang up the call."""
-        await self._async_call_signal("reject", STATE_IDLE)
+        """Отклонить звонящий вызов или положить трубку в разговоре.
 
-    async def _async_call_signal(self, cmd: str, new_state: str) -> None:
+        Из форка: панель завершает отвеченный вызов командой `hangUp`, а ещё
+        звонящий — `reject`. Шлём подходящую по состоянию, при отказе — другую.
+        """
+        answered = self.call_state == STATE_ANSWERED
+        cmds = ("hangUp", "reject") if answered else ("reject", "hangUp")
+        await self._async_call_signal(cmds, STATE_IDLE)
+
+    async def _async_call_signal(self, cmds: tuple[str, ...], new_state: str) -> None:
         """Send answer/reject where the model has it; otherwise stay local.
 
-        DS-K1T341AM has no callSignal endpoint: the buttons then only move the
-        local call state (the popup and the door relay still work), and the
-        entity attributes say `answer_supported: no` so nobody is misled.
+        Commands are tried in order until one is accepted. DS-K1T341AM has no
+        callSignal endpoint: the buttons then only move the local call state
+        (the popup and the door relay still work), and the entity attributes
+        say `answer_supported: no` so nobody is misled.
         """
-        word = "принят" if cmd == "answer" else "сброшен"
+        word = "принят" if new_state == STATE_ANSWERED else "сброшен"
         if self.is_demo:
             _LOGGER.info("[%s] Вызов %s (демо)", self.name, word)
         elif self._client is not None:
-            try:
-                supported = await self._client.async_signal(cmd)
-            except ISAPIError as err:
-                _LOGGER.error("[%s] Команда «%s» не прошла: %s", self.name, cmd, err)
-                self._set_available(False, str(err))
-                return
-            self._set_available(True)
-            if not supported:
+            errors: list[ISAPIError] = []
+            for cmd in cmds:
+                try:
+                    if await self._client.async_signal(cmd):
+                        break
+                except ISAPIError as err:
+                    errors.append(err)
+                    _LOGGER.warning("[%s] Команда «%s» не прошла: %s", self.name, cmd, err)
+            else:
+                if len(errors) == len(cmds):
+                    _LOGGER.error("[%s] Вызов не %s: панель отвергла все команды", self.name, word)
+                    self._set_available(False, str(errors[-1]))
+                    return
                 _LOGGER.debug(
-                    "[%s] У модели нет команды «%s» — меняем только состояние "
-                    "в Home Assistant", self.name, cmd,
+                    "[%s] У модели нет команд %s — меняем только состояние "
+                    "в Home Assistant", self.name, "/".join(cmds),
                 )
+            self._set_available(True)
+        # Латч разговора (форк): дальше статус панели не закроет поп-ап, пока
+        # оператор не нажмёт «Сбросить» (или не выйдет MAX_TALK_SECONDS).
+        # В демо панели нет — демо ведёт себя как раньше.
+        self._answered = new_state == STATE_ANSWERED and not self.is_demo
+        self._answered_at = time.monotonic()
         self._apply_call_state(new_state)
 
     async def async_open_door(self) -> None:

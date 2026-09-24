@@ -1,7 +1,7 @@
 {
   "domain": "bms_intercom",
   "name": "BMS Intercom",
-  "version": "0.2.6",
+  "version": "0.3.0",
   "config_flow": true,
   "documentation": "https://github.com/optomtr/bms-intercom",
   "issue_tracker": "https://github.com/optomtr/bms-intercom/issues",
@@ -11,10 +11,13 @@
   "iot_class": "local_push",
   "integration_type": "device",
   "dependencies": [
-    "http"
+    "http",
+    "websocket_api",
+    "camera"
   ],
   "after_dependencies": [
-    "network"
+    "network",
+    "go2rtc"
   ],
   "requirements": []
 }

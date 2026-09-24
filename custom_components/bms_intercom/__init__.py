@@ -1,11 +1,13 @@
 """The BMS Intercom integration."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 
 import voluptuous as vol
 
+from homeassistant.components import websocket_api
 from homeassistant.components.frontend import add_extra_js_url
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
@@ -24,15 +26,84 @@ from .const import (
 from .callsource import _SKIP_RELOAD
 from .device import BMSIntercomDevice
 from .proxy import HTTPSProxy
+from .talkback import decode_talk_chunk
 
 _LOGGER = logging.getLogger(__name__)
 
 _PROXY_KEY = f"{DOMAIN}_https_proxy"
 _FRONTEND_FLAG = f"{DOMAIN}_frontend_registered"
+_WS_FLAG = f"{DOMAIN}_ws_registered"
 _STATIC_URL = f"/{DOMAIN}_static"
-# Bump on any frontend change so browsers reload the cached module.
-_CARD_VERSION = "0.6.1"
-_CARD_URL = f"{_STATIC_URL}/bms_intercom_card.js?v={_CARD_VERSION}"
+_CARD_FILE = "bms_intercom_card.js"
+
+
+# --- микрофон оператора: WebSocket-команды (из форка) ------------------------
+def _device_from_msg(hass: HomeAssistant, msg) -> BMSIntercomDevice | None:
+    return (hass.data.get(DOMAIN) or {}).get(msg.get("entry_id"))
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/talk_start", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def _ws_talk_start(hass, connection, msg) -> None:
+    device = _device_from_msg(hass, msg)
+    _LOGGER.debug("WS talk_start (entry=%s, найден=%s)", msg.get("entry_id"), device is not None)
+    if device is not None:
+        await device.async_talk_start()
+    connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): f"{DOMAIN}/talk_data",
+        vol.Required("entry_id"): str,
+        vol.Required("data"): str,  # base64, сырой G.711
+    }
+)
+@websocket_api.async_response
+async def _ws_talk_data(hass, connection, msg) -> None:
+    device = _device_from_msg(hass, msg)
+    # Мусорный base64 и кусок больше MAX_TALK_B64 до панели не доходят.
+    chunk = decode_talk_chunk(msg.get("data"))
+    if device is not None and chunk:
+        await device.async_talk_send(chunk)
+    connection.send_result(msg["id"])
+
+
+@websocket_api.websocket_command(
+    {vol.Required("type"): f"{DOMAIN}/talk_stop", vol.Required("entry_id"): str}
+)
+@websocket_api.async_response
+async def _ws_talk_stop(hass, connection, msg) -> None:
+    device = _device_from_msg(hass, msg)
+    if device is not None:
+        await device.async_talk_stop()
+    connection.send_result(msg["id"])
+
+
+def _async_register_ws(hass: HomeAssistant) -> None:
+    """Register the mic-streaming WebSocket commands once per HA run."""
+    if hass.data.get(_WS_FLAG):
+        return
+    hass.data[_WS_FLAG] = True
+    websocket_api.async_register_command(hass, _ws_talk_start)
+    websocket_api.async_register_command(hass, _ws_talk_data)
+    websocket_api.async_register_command(hass, _ws_talk_stop)
+
+
+def _card_version() -> str:
+    """Метка кэша = md5 самого файла карточки (из форка).
+
+    Ручной номер версии забывали поднимать — браузеры держали старый поп-ап.
+    Хэш содержимого меняется с каждой правкой сам; хватает перезапуска HA.
+    """
+    path = os.path.join(os.path.dirname(__file__), "frontend", _CARD_FILE)
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:10]
+    except OSError:
+        return "dev"
 
 
 async def _async_register_frontend(hass: HomeAssistant) -> None:
@@ -44,8 +115,10 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     await hass.http.async_register_static_paths(
         [StaticPathConfig(_STATIC_URL, frontend_dir, False)]
     )
-    add_extra_js_url(hass, _CARD_URL)
-    _LOGGER.debug("Поп-ап домофона зарегистрирован: %s", _CARD_URL)
+    version = await hass.async_add_executor_job(_card_version)
+    card_url = f"{_STATIC_URL}/{_CARD_FILE}?v={version}"
+    add_extra_js_url(hass, card_url)
+    _LOGGER.debug("Поп-ап домофона зарегистрирован: %s", card_url)
 
 
 async def _async_start_proxy(hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -99,6 +172,7 @@ async def _async_register_services(hass: HomeAssistant) -> None:
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up BMS Intercom from a config entry."""
     await _async_register_frontend(hass)
+    _async_register_ws(hass)
     await _async_register_services(hass)
     await _async_start_proxy(hass, entry)
 

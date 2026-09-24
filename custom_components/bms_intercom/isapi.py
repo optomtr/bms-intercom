@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, AsyncIterator, Callable
 
 import httpx
 
 from .endpoints import (
     AUTH_DIGEST,
+    XML_CT,
     Call,
     DEFAULT_CHANNEL,
     alert_stream_paths,
@@ -47,6 +49,7 @@ from .events import (
     parse_document,
 )
 from .probing import ProbeMixin
+from .talkback import between
 from .transport import (
     AuthTransportMixin,
     describe_error,
@@ -274,6 +277,14 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
     async def async_reject(self) -> bool:
         return await self.async_signal("reject")
 
+    async def async_hangup(self) -> bool:
+        """Положить трубку в УЖЕ отвеченном вызове (из форка, DS-KV6113).
+
+        Hikvision различает: `reject` отклоняет только звонящий вызов, а идущий
+        разговор завершает `hangUp`.
+        """
+        return await self.async_signal("hangUp")
+
     async def async_signal(self, cmd: str) -> bool:
         """Send `answer`/`reject`; False when the model has no such command."""
         return await self._async_signal(cmd)
@@ -302,9 +313,16 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
             self.call_signal_supported = True
             return True
         if tolerate(last_status):
-            self.call_signal_supported = False
+            # Модель, у которой callSignal уже подтверждён, отказала именно
+            # в этой команде (например, hangUp/reject не к месту по состоянию
+            # вызова) — это не повод выключать ответ/сброс на всю сессию и не
+            # повод запоминать команду как несуществующую.
+            if self.call_signal_supported is True:
+                self._signal_calls.pop(cmd, None)
+            else:
+                self.call_signal_supported = False
             _LOGGER.info(
-                "Панель не поддерживает «%s» (HTTP %s) — команда пропущена",
+                "Панель не приняла «%s» (HTTP %s) — команда пропущена",
                 cmd, last_status,
             )
             return False
@@ -313,6 +331,31 @@ class ISAPIClient(AuthTransportMixin, ProbeMixin):
     async def async_open_door(self) -> None:
         """Open the door relay using whichever shape this model accepts."""
         await self._call_selected(door_calls(self._door_no), "_door_call")
+
+    async def async_ensure_twoway_codec(self, codec: str = "G.711ulaw") -> None:
+        """Best-effort: кодек two-way audio панели = G.711 µ-law (из форка).
+
+        Браузер шлёт G.711 µ-law (talkback.py); совпадение с панелью избавляет
+        от перекодирования. Уже стоит — ничего не делаем. Модель без
+        two-way audio (DS-K1T341AM) отвечает 404 — ISAPIError ловит вызывающий.
+        """
+        base = "/ISAPI/System/TwoWayAudio/channels"
+        resp = await self._request(Call("twoWayAudio.channels", "GET", base))
+        cid = between(resp.text, "<id>", "<") or "1"
+        if between(resp.text, "<audioCompressionType>", "<") == codec:
+            return
+        resp = await self._request(Call("twoWayAudio.channel", "GET", f"{base}/{cid}"))
+        if "<audioCompressionType>" not in resp.text:
+            return
+        new_xml = re.sub(
+            r"<audioCompressionType>.*?</audioCompressionType>",
+            f"<audioCompressionType>{codec}</audioCompressionType>",
+            resp.text, count=1,
+        )
+        await self._request(
+            Call("twoWayAudio.codec", "PUT", f"{base}/{cid}", new_xml, XML_CT)
+        )
+        _LOGGER.info("Кодек two-way audio установлен в %s (канал %s)", codec, cid)
 
     # --- event stream ------------------------------------------------------
     async def async_iter_alerts(

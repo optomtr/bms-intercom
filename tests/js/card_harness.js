@@ -19,6 +19,7 @@ function fakeElement() {
     querySelector() { return fakeElement(); },
     querySelectorAll() { return []; },
     addEventListener() {}, appendChild() {}, setAttribute() {},
+    getAttribute() { return null; }, removeAttribute() {}, load() {},
     play() { return Promise.resolve(); }, pause() {},
   };
   return el;

@@ -34,6 +34,44 @@ _HOP = {
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
 }
 
+# Заголовки пересылки. Прокси их вырезает (анти-спуф из форка: клиент не
+# должен выдавать себя за другой IP) и НЕ ставит сам.
+#
+# Почему не ставит: Home Assistant (components/http/forwarded.py) отвечает
+# 400 на ЛЮБОЙ запрос с X-Forwarded-For, если в `http:` не включены
+# use_x_forwarded_for и trusted_proxies со 127.0.0.1 — а по умолчанию они
+# выключены. Надёжно узнать эти настройки из интеграции нельзя
+# (use_x_forwarded_for не хранится на hass.http), поэтому HA видит прокси как
+# localhost — так и задумано с bed2583, trusted_proxies не нужен. Без XFF ядро
+# HA игнорирует и X-Forwarded-Proto/Host, так что их тоже не ставим.
+_FORWARD_STRIP = {
+    "x-forwarded-for", "x-forwarded-proto", "x-forwarded-host", "forwarded",
+    "x-real-ip",
+}
+
+# HTTP: не пересылаем hop-by-hop, Host (aiohttp поставит свой) и пересылочные.
+_HTTP_SKIP = _HOP | _FORWARD_STRIP | {"host"}
+
+# WebSocket: рукопожатие aiohttp строит сам — его заголовки тоже не шлём.
+# Всё остальное (cookies и т.п.) пересылается так же, как в HTTP: иначе сессия
+# Ingress аддонов (Music Assistant и пр.) в WS не проходит (фикс форка 6bbbdad).
+_WS_SKIP = _HTTP_SKIP | {
+    "sec-websocket-key", "sec-websocket-version",
+    "sec-websocket-extensions", "sec-websocket-protocol",
+}
+
+
+def _forward_headers(request: web.Request, skip: set[str]) -> CIMultiDict[str]:
+    """Заголовки клиента для запроса к HA — один путь для HTTP и WS.
+
+    CIMultiDict + add() сохраняет повторяющиеся заголовки (несколько Cookie).
+    """
+    headers: CIMultiDict[str] = CIMultiDict()
+    for k, v in request.headers.items():
+        if k.lower() not in skip:
+            headers.add(k, v)
+    return headers
+
 
 def _build_cert(cert_path: str, key_path: str, hostnames: list[str], ips: list[str]) -> None:
     """Generate a long-lived self-signed cert with SAN, if not present yet."""
@@ -77,6 +115,11 @@ def _build_cert(cert_path: str, key_path: str, hostnames: list[str], ips: list[s
             serialization.PrivateFormat.TraditionalOpenSSL,
             serialization.NoEncryption(),
         ))
+    # Private key — readable only by the owner (best-effort; no-op on Windows).
+    try:
+        os.chmod(key_path, 0o600)
+    except OSError:
+        pass
     with open(cert_path, "wb") as fh:
         fh.write(cert.public_bytes(serialization.Encoding.PEM))
     _LOGGER.info("BMS Intercom: создан самоподписанный сертификат (%s)", cert_path)
@@ -153,11 +196,7 @@ class HTTPSProxy:
     async def _http(self, request: web.Request) -> web.StreamResponse:
         assert self._session is not None
         url = _BACKEND + request.rel_url.raw_path_qs
-        # CIMultiDict + add() preserves duplicate headers (e.g. multiple Set-Cookie).
-        headers: CIMultiDict[str] = CIMultiDict()
-        for k, v in request.headers.items():
-            if k.lower() not in _HOP and k.lower() != "host":
-                headers.add(k, v)
+        headers = _forward_headers(request, _HTTP_SKIP)
         try:
             backend = await self._session.request(
                 request.method, url, headers=headers,
@@ -183,24 +222,36 @@ class HTTPSProxy:
 
     async def _ws(self, request: web.Request) -> web.StreamResponse:
         assert self._session is not None
-        server_ws = web.WebSocketResponse(protocols=request.headers.get("Sec-WebSocket-Protocol", "").split(",") if request.headers.get("Sec-WebSocket-Protocol") else ())
+        raw_proto = request.headers.get("Sec-WebSocket-Protocol", "")
+        protocols = tuple(p.strip() for p in raw_proto.split(",") if p.strip())
+        server_ws = web.WebSocketResponse(protocols=protocols)
         await server_ws.prepare(request)
         url = _WS_BACKEND + request.rel_url.raw_path_qs
+
+        # Cookies и прочие заголовки — тем же путём, что и в HTTP (см. _WS_SKIP).
+        ws_headers = _forward_headers(request, _WS_SKIP)
+
         try:
-            client_ws = await self._session.ws_connect(url, heartbeat=30)
+            client_ws = await self._session.ws_connect(
+                url, heartbeat=30, headers=ws_headers, protocols=protocols
+            )
         except aiohttp.ClientError as err:
             _LOGGER.debug("BMS Intercom: ws backend error: %s", err)
             await server_ws.close()
             return server_ws
 
         async def pump(src, dst) -> None:
-            async for msg in src:
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    await dst.send_str(msg.data)
-                elif msg.type == aiohttp.WSMsgType.BINARY:
-                    await dst.send_bytes(msg.data)
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
-                    break
+            try:
+                async for msg in src:
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        await dst.send_str(msg.data)
+                    elif msg.type == aiohttp.WSMsgType.BINARY:
+                        await dst.send_bytes(msg.data)
+                    elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                        break
+            except (aiohttp.ClientError, ConnectionResetError, RuntimeError):
+                # Другая сторона уже закрывается — при разрыве это нормально.
+                pass
 
         tasks = [
             asyncio.create_task(pump(client_ws, server_ws)),
@@ -212,6 +263,9 @@ class HTTPSProxy:
             _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
+            # Заберём результаты/исключения отменённых задач, иначе HA
+            # залогирует «Task exception was never retrieved».
+            await asyncio.gather(*pending, return_exceptions=True)
         except (asyncio.CancelledError, aiohttp.ClientError, ConnectionResetError):
             pass
         finally:

@@ -63,6 +63,7 @@ PLATFORMS: list[Platform] = [
     Platform.CAMERA,
     Platform.BINARY_SENSOR,
     Platform.BUTTON,
+    Platform.SWITCH,
 ]
 
 # RTSP main stream path (channel 101 = main, 102 = sub). Kept for compatibility;
