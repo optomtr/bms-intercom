@@ -824,8 +824,8 @@
   let RELOAD_ENABLED = false;
   try { RELOAD_ENABLED = !!CARD_VERSION && location.protocol !== "file:"; } catch (e) { /* выкл */ }
   let staleSince = 0;
-  let reloadTriedAt = 0; // страж в памяти: единственный, если sessionStorage закрыт
-
+  let reloadTriedAt = 0; // дополнительный страж в памяти (сбрасывается reload'ом)
+  let manualNoticeFor = null; // «обновите вручную» — одной строкой на версию
   function staleTarget(groups) {
     for (const g of Object.values(groups)) {
       if (g.cardVersion && g.cardVersion !== CARD_VERSION) return g.cardVersion;
@@ -835,14 +835,22 @@
 
   // Защита от петли: если и после reload версия чужая (кэш, прокси), страница не
   // должна перезагружаться каждые 5 с — одна попытка на целевую версию за 10 мин.
+  // Метка живёт в sessionStorage, закрыт — в localStorage. Закрыты оба —
+  // страж в памяти пережить reload не может, петля возможна → не перезагружаем.
+  // Ответ: "ok" | "guard" (уже пробовали) | "nostore" (негде запомнить).
   function reloadAllowed(target, now) {
-    if (reloadTriedAt && Math.abs(now - reloadTriedAt) < RELOAD_GUARD_MS) return false;
-    let prev = null;
-    try { prev = JSON.parse(window.sessionStorage.getItem(RELOAD_KEY) || "null"); } catch (e) { /* закрыт или мусор */ }
-    if (prev && prev.v === target && Math.abs(now - prev.t) < RELOAD_GUARD_MS) return false;
-    try { window.sessionStorage.setItem(RELOAD_KEY, JSON.stringify({ v: target, t: now })); } catch (e) { /* закрыт — хватит памяти */ }
-    reloadTriedAt = now;
-    return true;
+    if (reloadTriedAt && Math.abs(now - reloadTriedAt) < RELOAD_GUARD_MS) return "guard";
+    for (const name of ["sessionStorage", "localStorage"]) {
+      let store = null, raw = null;
+      try { store = window[name]; raw = store.getItem(RELOAD_KEY); } catch (e) { continue; }
+      let prev = null;
+      try { prev = JSON.parse(raw || "null"); } catch (e) { /* мусор — как пусто */ }
+      if (prev && prev.v === target && Math.abs(now - prev.t) < RELOAD_GUARD_MS) return "guard";
+      try { store.setItem(RELOAD_KEY, JSON.stringify({ v: target, t: now })); } catch (e) { continue; }
+      reloadTriedAt = now;
+      return "ok";
+    }
+    return "nostore";
   }
 
   function checkStaleCard(groups) {
@@ -853,7 +861,16 @@
     if (!staleSince) { staleSince = now; return; }
     if (now - staleSince < STALE_IDLE_MS) return;
     staleSince = 0;
-    if (!reloadAllowed(target, now)) return;
+    const verdict = reloadAllowed(target, now);
+    if (verdict === "nostore") {
+      if (manualNoticeFor !== target) {
+        manualNoticeFor = target;
+        // eslint-disable-next-line no-console
+        console.info(`BMS Intercom: версия карточки ${CARD_VERSION} устарела (в HA ${target}) — обновите страницу вручную`);
+      }
+      return;
+    }
+    if (verdict !== "ok") return;
     // eslint-disable-next-line no-console
     console.info(`BMS Intercom: карточка ${CARD_VERSION} устарела (в HA ${target}) — перезагружаю страницу`);
     location.reload();

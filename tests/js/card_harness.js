@@ -318,16 +318,18 @@ function memStorage() {
   const m = {};
   return { getItem(k) { return k in m ? m[k] : null; }, setItem(k, v) { m[k] = String(v); } };
 }
-function freshCard({ script = "", filename, protocol = "http:", storage, now = 1.7e12 } = {}) {
+function freshCard({ script = "", filename, protocol = "http:", storage, local, now = 1.7e12 } = {}) {
   const env = { now, reloads: 0, infos: [], warns: 0 };
   env.hass = { states: {}, callService() {},
     connection: { sendMessagePromise() { return new Promise(() => {}); },
                   subscribeMessage() { return Promise.resolve(() => {}); } } };
   const win = { __BMS_INTERCOM_TEST__: {}, isSecureContext: true, customCards: [] };
-  if (storage === "throws") {
-    Object.defineProperty(win, "sessionStorage", { get() { throw new Error("SecurityError"); } });
-  } else if (storage) {
-    win.sessionStorage = storage;
+  for (const [name, st] of [["sessionStorage", storage], ["localStorage", local]]) {
+    if (st === "throws") {
+      Object.defineProperty(win, name, { get() { throw new Error("SecurityError"); } });
+    } else if (st) {
+      win[name] = st;
+    }
   }
   const box = {
     __env: env, window: win,
@@ -367,6 +369,7 @@ function freshCard({ script = "", filename, protocol = "http:", storage, now = 1
   // Цикл поп-апа каждые 400 мс, как в браузере.
   env.run = (ms) => { for (let t = 0; t < ms; t += 400) { env.now += 400; env.api.safeTick(); } return env.reloads; };
   env.reloadLines = () => env.infos.filter((l) => l.includes("перезагружаю")).length;
+  env.manualLines = () => env.infos.filter((l) => l.includes("обновите страницу вручную")).length;
   return env;
 }
 attempt("stale_reload_once", () => {
@@ -416,10 +419,23 @@ attempt("stale_repeat_guard", () => {
   r.newTarget = next.run(6000);
   return r;
 });
+attempt("stale_session_off_local_on", () => {
+  // sessionStorage закрыт — метка в localStorage; повтор той же цели в 10 мин — нет.
+  const local = memStorage();
+  const first = freshCard({ script: CARD_URL + "old111", storage: "throws", local });
+  first.set("new222");
+  const r = { first: first.run(6000), lines: first.reloadLines() };
+  const again = freshCard({ script: CARD_URL + "old111", storage: "throws", local,
+                            now: first.now + 30000 });
+  again.set("new222");
+  r.again = again.run(60000);
+  return r;
+});
 attempt("stale_no_storage", () => {
-  const c = freshCard({ script: CARD_URL + "old111", storage: "throws" });
+  // Оба хранилища закрыты: страж в памяти reload не переживёт — не перезагружаем.
+  const c = freshCard({ script: CARD_URL + "old111", storage: "throws", local: "throws" });
   c.set("new222");
-  return { first: c.run(6000), in9min: c.run(9 * 60000), warns: c.warns };
+  return { reloads: c.run(60000), manual: c.manualLines(), warns: c.warns };
 });
 attempt("stale_unknown_version", () => {
   const plain = freshCard({ storage: memStorage() });            // ни currentScript, ни ?v= в стеке

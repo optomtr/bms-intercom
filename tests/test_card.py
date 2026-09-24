@@ -153,9 +153,14 @@ class TestPopupCard(unittest.TestCase):
         self.assertEqual(self.assertSurvives("stale_repeat_guard"),
                          {"first": 1, "again": 0, "after10min": 1, "newTarget": 1})
 
-    def test_without_session_storage_memory_guard_holds(self):
+    def test_session_storage_off_falls_back_to_local_storage(self):
+        self.assertEqual(self.assertSurvives("stale_session_off_local_on"),
+                         {"first": 1, "lines": 1, "again": 0})
+
+    def test_no_storage_at_all_never_reloads(self):
+        """Негде запомнить попытку → петля возможна → только «обновите вручную», один раз."""
         self.assertEqual(self.assertSurvives("stale_no_storage"),
-                         {"first": 1, "in9min": 1, "warns": 0})
+                         {"reloads": 0, "manual": 1, "warns": 0})
 
     def test_unknown_own_version_or_kiosk_never_reloads(self):
         self.assertEqual(self.assertSurvives("stale_unknown_version"),
