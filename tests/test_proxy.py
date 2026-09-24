@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 
 try:
     import homeassistant  # noqa: F401  - раньше voluptuous, как в HA
@@ -75,23 +76,61 @@ def _fake_ha(seen: dict) -> web.Application:
     return app
 
 
+class FakeHass:
+    """Ровно то, что прокси спрашивает у HA: порт и SSL компонента http."""
+
+    def __init__(self, server_port=None, ssl_certificate=None, api=None):
+        self.http = SimpleNamespace(server_port=server_port, ssl_certificate=ssl_certificate)
+        self.config = SimpleNamespace(api=api)
+
+
+@unittest.skipIf(aiohttp is None, "aiohttp not installed")
+class TestBackendFromHaPort(unittest.TestCase):
+    """0.3.3: адрес бэкенда был зашит 127.0.0.1:8123, а HA на объекте на :80 → 502."""
+
+    def setUp(self):
+        self.proxy_mod = load("proxy")
+
+    def urls(self, hass):
+        proxy = self.proxy_mod.HTTPSProxy(hass, 8443)
+        return proxy._backend, proxy._ws_backend
+
+    def test_port_80_from_hass_http(self):
+        self.assertEqual(
+            self.urls(FakeHass(server_port=80)),
+            ("http://127.0.0.1:80", "ws://127.0.0.1:80"),
+        )
+
+    def test_api_config_is_the_fallback(self):
+        hass = FakeHass(api=SimpleNamespace(port=8124, use_ssl=False))
+        self.assertEqual(self.urls(hass), ("http://127.0.0.1:8124", "ws://127.0.0.1:8124"))
+
+    def test_nothing_known_falls_back_to_8123(self):
+        self.assertEqual(self.urls(None), ("http://127.0.0.1:8123", "ws://127.0.0.1:8123"))
+
+    def test_ha_with_own_ssl_is_reached_over_tls(self):
+        for hass in (
+            FakeHass(server_port=443, ssl_certificate="/ssl/fullchain.pem"),
+            FakeHass(api=SimpleNamespace(port=443, use_ssl=True)),
+        ):
+            with self.subTest(hass=vars(hass.http)):
+                self.assertEqual(
+                    self.urls(hass), ("https://127.0.0.1:443", "wss://127.0.0.1:443")
+                )
+
+
 @unittest.skipIf(aiohttp is None, "aiohttp not installed")
 class TestProxyForwardHeaders(unittest.TestCase):
     def setUp(self):
         self.proxy_mod = load("proxy")
-        self._saved = (self.proxy_mod._BACKEND, self.proxy_mod._WS_BACKEND)
-
-    def tearDown(self):
-        self.proxy_mod._BACKEND, self.proxy_mod._WS_BACKEND = self._saved
 
     async def _run(self, action):
         seen: dict = {}
         backend = TestServer(_fake_ha(seen), host="127.0.0.1")
         await backend.start_server()
-        self.proxy_mod._BACKEND = f"http://127.0.0.1:{backend.port}"
-        self.proxy_mod._WS_BACKEND = f"ws://127.0.0.1:{backend.port}"
 
-        proxy = self.proxy_mod.HTTPSProxy(None, 0)
+        # Порт фейкового HA прокси узнаёт так же, как на объекте: от hass.http.
+        proxy = self.proxy_mod.HTTPSProxy(FakeHass(server_port=backend.port), 0)
         # Та же сессия, что строит async_start (без TLS — он тут не при чём).
         proxy._session = aiohttp.ClientSession(
             auto_decompress=False, cookie_jar=aiohttp.DummyCookieJar()

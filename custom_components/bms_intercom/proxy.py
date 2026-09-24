@@ -4,7 +4,8 @@ To use the browser microphone (two-way audio) the Home Assistant page must be
 opened over a secure context (HTTPS). Instead of asking the user to set up an
 add-on, this module starts — automatically, inside the integration — a small
 HTTPS reverse proxy on a separate port that forwards everything (pages,
-WebSocket, camera streams) to Home Assistant on 127.0.0.1:8123.
+WebSocket, camera streams) to Home Assistant on 127.0.0.1 — on the port HA
+itself listens on (see backend_urls).
 
 The user configures nothing: a self-signed certificate is generated on first
 run (SAN covers all local IPs + hostnames). The only unavoidable step is the
@@ -25,8 +26,33 @@ from multidict import CIMultiDict
 
 _LOGGER = logging.getLogger(__name__)
 
-_BACKEND = "http://127.0.0.1:8123"
-_WS_BACKEND = "ws://127.0.0.1:8123"
+#: Последний запасной порт — только если HA не сказал свой (не должно быть).
+_DEFAULT_HA_PORT = 8123
+
+
+def backend_urls(hass) -> tuple[str, str]:
+    """Адрес HA для прокси: (http-база, ws-база) на 127.0.0.1.
+
+    Почему не зашитый 8123: на объекте HA слушает порт 80 (server_port в
+    `http:`), 8123 закрыт — прокси отвечал 502 на всё. Порт берём у самого HA:
+    hass.http.server_port (ставится при setup компонента http — он у нас в
+    dependencies, значит к старту интеграции уже есть), запасной —
+    hass.config.api.port. Если в `http:` задан ssl_certificate, HA на этом
+    порту говорит только TLS — тогда https/wss (проверку сертификата
+    отключает _BACKEND_SSL: свой же HA на loopback, сертификат выписан на имя).
+    """
+    http = getattr(hass, "http", None)
+    api = getattr(getattr(hass, "config", None), "api", None)
+    port = getattr(http, "server_port", None) or getattr(api, "port", None)
+    if not isinstance(port, int) or not 0 < port < 65536:
+        port = _DEFAULT_HA_PORT
+    tls = bool(getattr(http, "ssl_certificate", None) or getattr(api, "use_ssl", False))
+    host = f"127.0.0.1:{port}"
+    return (f"https://{host}", f"wss://{host}") if tls else (f"http://{host}", f"ws://{host}")
+
+
+#: aiohttp: False = не проверять сертификат (на http-адрес не влияет).
+_BACKEND_SSL = False
 
 # Hop-by-hop headers must not be forwarded.
 _HOP = {
@@ -133,6 +159,7 @@ class HTTPSProxy:
         self.port = port
         self._runner: web.AppRunner | None = None
         self._session: aiohttp.ClientSession | None = None
+        self._backend, self._ws_backend = backend_urls(hass)
 
     async def async_start(self) -> None:
         cert_path = self.hass.config.path("bms_intercom", "https_cert.pem")
@@ -163,7 +190,9 @@ class HTTPSProxy:
             _LOGGER.error("BMS Intercom: не удалось занять порт %s: %s", self.port, err)
             await self.async_stop()
             return
-        _LOGGER.info("BMS Intercom: локальный HTTPS поднят на порту %s", self.port)
+        _LOGGER.info(
+            "BMS Intercom: локальный HTTPS поднят на порту %s → %s", self.port, self._backend
+        )
 
     async def async_stop(self) -> None:
         if self._runner is not None:
@@ -195,13 +224,13 @@ class HTTPSProxy:
 
     async def _http(self, request: web.Request) -> web.StreamResponse:
         assert self._session is not None
-        url = _BACKEND + request.rel_url.raw_path_qs
+        url = self._backend + request.rel_url.raw_path_qs
         headers = _forward_headers(request, _HTTP_SKIP)
         try:
             backend = await self._session.request(
                 request.method, url, headers=headers,
                 data=request.content if request.body_exists else None,
-                allow_redirects=False,
+                allow_redirects=False, ssl=_BACKEND_SSL,
             )
         except aiohttp.ClientError as err:
             return web.Response(status=502, text=f"intercom proxy: {err}")
@@ -226,14 +255,15 @@ class HTTPSProxy:
         protocols = tuple(p.strip() for p in raw_proto.split(",") if p.strip())
         server_ws = web.WebSocketResponse(protocols=protocols)
         await server_ws.prepare(request)
-        url = _WS_BACKEND + request.rel_url.raw_path_qs
+        url = self._ws_backend + request.rel_url.raw_path_qs
 
         # Cookies и прочие заголовки — тем же путём, что и в HTTP (см. _WS_SKIP).
         ws_headers = _forward_headers(request, _WS_SKIP)
 
         try:
             client_ws = await self._session.ws_connect(
-                url, heartbeat=30, headers=ws_headers, protocols=protocols
+                url, heartbeat=30, headers=ws_headers, protocols=protocols,
+                ssl=_BACKEND_SSL,
             )
         except aiohttp.ClientError as err:
             _LOGGER.debug("BMS Intercom: ws backend error: %s", err)
