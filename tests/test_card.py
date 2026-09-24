@@ -84,6 +84,31 @@ class TestPopupCard(unittest.TestCase):
         """0.3.5: talk_via=sdk (DS-K1T341AM через HCNetSDK) — микрофон как у ISAPI."""
         self.assertEqual(self.assertSurvives("talk_sdk"), {"hidden": False, "gum": 1})
 
+    def test_operator_speech_ducks_the_panel_then_releases(self):
+        """Эхо с объекта: пока оператор говорит — звук панели 0.12, тишина дольше удержания — 1.0."""
+        self.assertEqual(self.assertSurvives("duck_speech"),
+                         {"quiet": 1, "s1": 1, "talk": 0.12, "held": 0.12, "back": 1})
+
+    def test_mic_off_never_ducks(self):
+        self.assertEqual(self.assertSurvives("duck_mic_off"), {"off": 1, "offMid": 1})
+
+    def test_steady_room_noise_is_not_endless_speech(self):
+        """Порог = max(base, фон×3): ровный шум уходит в фон, речь над ним всё равно глушит."""
+        self.assertEqual(self.assertSurvives("duck_noisy_room"), {"noise": 1, "voice": 0.12})
+
+    def test_duck_chain_plays_once_and_is_torn_down(self):
+        """Звук панели WebRTC → GainNode при микрофоне; <video> немой (без удвоения);
+        микрофон выкл/закрытие поп-апа снимают узлы и AudioContext; без WebAudio — как раньше."""
+        got = self.assertSurvives("duck_wired")
+        self.assertFalse(got["beforeMic"], "до микрофона звук панели должен играть <video>")
+        self.assertTrue(got["routedMuted"], "<video> играет параллельно с WebAudio — звук двойной")
+        self.assertTrue(got["toSpeaker"], "GainNode не выведен в динамик")
+        self.assertEqual((got["speech"], got["after"]), (0.12, 1))
+        self.assertEqual(got["micOff"], {"muted": False, "ctx": "closed", "src": 0, "timer": True})
+        self.assertEqual(got["closed"], {"ctx": "closed", "src": 0, "gain": 0, "timer": True, "muted": True})
+        self.assertEqual(got["warnings"], 0)
+        self.assertFalse(got["noWebAudioMuted"], "без WebAudio звук панели пропал")
+
     def test_a_failing_tick_is_logged_once_not_every_400ms(self):
         self.assertSurvives("safe_tick_swallows")
         self.assertEqual(self.out["warnings"], 1)

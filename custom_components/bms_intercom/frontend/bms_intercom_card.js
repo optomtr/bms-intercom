@@ -13,6 +13,8 @@
  * (camera/webrtc/offer Home Assistant → go2rtc). Микрофон оператора идёт
  * отдельно: G.711 µ-law по WebSocket интеграции (bms_intercom/talk_*) → панели
  * по ISAPI или, если ISAPI звук не принимает, через помощник HCNetSDK.
+ * Пока микрофон включён, звук панели играет не <video>, а WebAudio с
+ * приглушением на время речи оператора (громкая связь против эха).
  * Камера без STREAM (демо-режим) показывается MJPEG-картинкой.
  *
  * Один файл намеренно: киоск на file:// подгружает его обычным <script>, где
@@ -336,13 +338,18 @@
   }
 
   // --- Звук панели --------------------------------------------------------
+  // soundMuted — «Звук» глазами оператора. Кто реально играет звук панели
+  // (<video> или цепочка громкой связи), решает duckSync(), поэтому v.muted
+  // больше не состояние, а следствие.
+  let soundMuted = true;
   function videoElem() { return overlay && overlay.querySelector("video.bms-video"); }
-  function isMuted() { const v = videoElem(); return !v || v.muted; }
+  function isMuted() { return !videoElem() || soundMuted; }
 
   function setMuted(muted) {
     const v = videoElem();
     if (!v) return;
-    v.muted = muted;
+    soundMuted = muted;
+    duckSync();
     if (!muted) v.play().catch(() => {});
     updateSoundBtn();
   }
@@ -350,9 +357,9 @@
   function attemptUnmute() {
     const v = videoElem();
     if (!v) return;
-    v.muted = false;
+    soundMuted = false; duckSync();
     Promise.resolve(v.play()).then(() => updateSoundBtn())
-      .catch(() => { v.muted = true; v.play().catch(() => {}); updateSoundBtn(); });
+      .catch(() => { soundMuted = true; duckSync(); v.play().catch(() => {}); updateSoundBtn(); });
   }
 
   function updateSoundBtn() {
@@ -449,6 +456,9 @@
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
       micCtx = new AC();
+      // Контекст может ожить позже (политика автозапуска) или прерваться
+      // (iOS) — громкая связь включается/снимается вслед за ним.
+      micCtx.onstatechange = () => duckSync();
       if (micCtx.state === "suspended") { try { await micCtx.resume(); } catch (e) {} }
       micSrc = micCtx.createMediaStreamSource(micStream);
       micProc = micCtx.createScriptProcessor(4096, 1, 1);
@@ -463,7 +473,7 @@
     } catch (e) {
       console.warn("BMS Intercom: аудио-конвейер микрофона", e);
     }
-    micOn = true; updateMicBtn(); return true;
+    micOn = true; updateMicBtn(); duckSync(); return true;
   }
 
   async function toggleMic() {
@@ -476,13 +486,116 @@
     const wasActive = !!micStream;
     if (micProc) { try { micProc.disconnect(); micProc.onaudioprocess = null; } catch (e) {} micProc = null; }
     if (micSrc) { try { micSrc.disconnect(); } catch (e) {} micSrc = null; }
-    if (micCtx) { try { micCtx.close(); } catch (e) {} micCtx = null; }
+    if (micCtx) { try { micCtx.onstatechange = null; micCtx.close(); } catch (e) {} micCtx = null; }
     if (micStream) { micStream.getTracks().forEach((t) => t.stop()); micStream = null; }
     if (wasActive) {
       const hass = getHass();
       if (hass && activeId) hass.connection.sendMessagePromise({ type: "bms_intercom/talk_stop", entry_id: activeId }).catch(() => {});
     }
     micOn = false;
+    duckSync(); // снимает громкую связь: без микрофона эха нет, звук снова играет <video>
+  }
+
+  // --- Громкая связь (ducking) против эха ----------------------------------
+  // Голос оператора из динамика терминала попадает в микрофон терминала и
+  // возвращается в поп-ап с задержкой. echoCancellation в getUserMedia тут
+  // бессилен: эхо уже внутри входящего потока, а не в нашем микрофоне. Как в
+  // телефоне на громкой связи: пока оператор говорит, входящий приглушаем.
+  const DUCK = {
+    base: 0.015,   // абсолютный порог RMS (≈ −36 dBFS): тише — не речь при любом фоне
+    floorMul: 3,   // порог = max(base, фон×3): ровный шум комнаты речью не считается
+    attackMs: 30,  // столько подряд громче порога — речь (щелчок/стук не глушит)
+    holdMs: 350,   // удержание: паузы между словами не дёргают гейн туда-сюда
+    low: 0.12,     // гейн входящего, пока оператор говорит
+    downMs: 50, upMs: 250, // спуск быстрый (эхо не успевает), возврат мягкий
+    frameMs: 20,   // шаг детектора
+  };
+  function duckInit() { return { floor: DUCK.base / DUCK.floorMul, over: 0, hold: 0, talking: false }; }
+  // Чистая функция (её проверяет харнесс без браузера): кадр RMS → гейн входящего.
+  function duckStep(s, rms, micOn, dtMs) {
+    if (!micOn) { s.over = 0; s.hold = 0; s.talking = false; return 1; } // микрофон молчит — эха нет
+    const dt = Math.max(0, Math.min(dtMs, 100));
+    const loud = rms > Math.max(DUCK.base, s.floor * DUCK.floorMul);
+    // Фон: вниз быстро (паузы между словами), вверх медленно, а во время речи
+    // ещё медленнее — иначе длинная фраза сама «записалась бы в фон». Но не
+    // заморожен: постоянный громкий шум за ~3 с станет фоном, а не вечной речью.
+    const tau = rms < s.floor ? 100 : (s.talking || loud) ? 10000 : 2000;
+    s.floor += (rms - s.floor) * Math.min(1, dt / tau);
+    if (loud) {
+      s.over += dt;
+      if (s.talking || s.over >= DUCK.attackMs) { s.talking = true; s.hold = DUCK.holdMs; }
+    } else {
+      s.over = 0;
+      if (s.talking && (s.hold -= dt) <= 0) s.talking = false;
+    }
+    return s.talking ? DUCK.low : 1;
+  }
+
+  let spkSrc = null, spkGain = null, micAn = null, duckTimer = null;
+  let duckState = null, duckTarget = 1, duckBuf = null, duckT = 0, duckWarned = false;
+
+  // Цепочка нужна только при включённом микрофоне (без него и эха нет):
+  // звонок, idle-просмотр, MJPEG, браузер без WebAudio — старый путь через <video>.
+  function duckSync() {
+    const v = videoElem();
+    const want = !!(v && micOn && micCtx && micSrc && micCtx.state === "running" && remoteStream
+      && remoteStream.getAudioTracks().length && v.srcObject === remoteStream);
+    if (want && !spkSrc) duckAttach();
+    else if (!want && spkSrc) duckDetach();
+    // Играет кто-то один, иначе звук (и эхо) удвоится. Поток с элемента не
+    // снимаем: без медиа-элемента Chrome отдаёт в MediaStreamSource удалённого
+    // WebRTC тишину — поэтому элемент остаётся, но немой.
+    if (v) v.muted = spkSrc ? true : soundMuted;
+    duckApply(0.01);
+  }
+
+  function duckAttach() {
+    try {
+      spkSrc = micCtx.createMediaStreamSource(remoteStream);
+      spkGain = micCtx.createGain();
+      micAn = micCtx.createAnalyser();
+      micAn.fftSize = 1024; // ≈21 мс окна при 48 кГц — под шаг 20 мс
+      duckBuf = new Float32Array(micAn.fftSize);
+      duckState = duckInit(); duckTarget = 1; duckT = micCtx.currentTime;
+      spkGain.gain.value = soundMuted ? 0 : 1;
+      spkSrc.connect(spkGain); spkGain.connect(micCtx.destination);
+      micSrc.connect(micAn); // тот же захват, что уходит на панель (уже после AEC/NS)
+      duckTimer = setInterval(duckPoll, DUCK.frameMs);
+    } catch (e) {
+      if (!duckWarned) { duckWarned = true; console.warn("BMS Intercom: громкая связь недоступна, звук как раньше", e); }
+      duckDetach();
+    }
+  }
+
+  function duckPoll() {
+    if (!micAn || !spkGain || !micCtx) return;
+    // Шаг — по часам звука, а не таймера: setInterval плавает, currentTime — нет.
+    const t = micCtx.currentTime, dt = (t - duckT) * 1000;
+    duckT = t;
+    if (micAn.getFloatTimeDomainData) micAn.getFloatTimeDomainData(duckBuf);
+    else { const b = new Uint8Array(duckBuf.length); micAn.getByteTimeDomainData(b); b.forEach((x, i) => { duckBuf[i] = (x - 128) / 128; }); }
+    let sum = 0;
+    for (let i = 0; i < duckBuf.length; i++) sum += duckBuf[i] * duckBuf[i];
+    const g = duckStep(duckState, Math.sqrt(sum / duckBuf.length), micOn, dt);
+    if (g === duckTarget) return;
+    const down = g < duckTarget;
+    duckTarget = g;
+    duckApply((down ? DUCK.downMs : DUCK.upMs) / 3000); // τ = время/3: к концу ~95% пути
+  }
+
+  function duckApply(tc) {
+    if (!spkGain || !micCtx) return;
+    const p = spkGain.gain, t = micCtx.currentTime, to = soundMuted ? 0 : duckTarget;
+    try { p.cancelScheduledValues(t); p.setValueAtTime(p.value, t); p.setTargetAtTime(to, t, tc); }
+    catch (e) { p.value = to; }
+  }
+
+  function duckDetach() {
+    if (duckTimer) { clearInterval(duckTimer); duckTimer = null; }
+    if (micSrc && micAn) { try { micSrc.disconnect(micAn); } catch (e) {} }
+    for (const n of [spkSrc, spkGain, micAn]) { if (n) { try { n.disconnect(); } catch (e) {} } }
+    spkSrc = spkGain = micAn = duckState = duckBuf = null;
+    duckTarget = 1;
   }
 
   // --- WebRTC (только приём: видео + входящий звук панели) ----------------
@@ -521,6 +634,7 @@
     wrCam = cam; wrSession = null; wrPending = [];
     remoteStream = new MediaStream();
     const v = videoElem();
+    soundMuted = true;
     if (v) { v.srcObject = remoteStream; v.muted = true; }
 
     let iceServers = [{ urls: "stun:stun.home-assistant.io:80" }];
@@ -539,6 +653,7 @@
       if (remoteStream && !remoteStream.getTracks().includes(ev.track)) remoteStream.addTrack(ev.track);
       const vv = videoElem();
       if (vv) { if (vv.srcObject !== remoteStream) vv.srcObject = remoteStream; vv.play().catch(() => {}); }
+      duckSync(); // звук панели мог прийти уже после включения микрофона
     };
     pc.onicecandidate = (ev) => { if (ev.candidate) sendCandidate(cam, ev.candidate); };
     pc.onconnectionstatechange = () => { if (pc) console.info("%cBMS Intercom: WebRTC %s", LOG, pc.connectionState); };
@@ -559,8 +674,10 @@
     if (wrUnsub) { try { const r = wrUnsub(); if (r && r.catch) r.catch(() => {}); } catch (e) {} wrUnsub = null; }
     if (pc) { try { pc.ontrack = null; pc.onicecandidate = null; pc.onconnectionstatechange = null; pc.close(); } catch (e) {} pc = null; }
     wrSession = null; wrCam = null; wrPending = [];
+    duckDetach(); // источник громкой связи привязан к этому потоку
     if (remoteStream) { remoteStream.getTracks().forEach((t) => { try { t.stop(); } catch (e) {} }); remoteStream = null; }
     const v = videoElem();
+    soundMuted = true;
     if (v) { v.srcObject = null; v.muted = true; }
   }
 
@@ -747,7 +864,7 @@
   });
 
   if (window.__BMS_INTERCOM_TEST__) {
-    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick, callRole };
+    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick, callRole, toggleMic, duckInit, duckStep, DUCK };
   }
 
   // eslint-disable-next-line no-console
