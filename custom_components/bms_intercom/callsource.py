@@ -26,7 +26,7 @@ from .const import (
     CALL_POLL_INTERVAL,
     CONF_ALERT_STREAM_SUPPORTED,
 )
-from .events import call_state_from_event
+from .events import call_state_from_event, is_history_event
 from .isapi import ISAPIAuthError, ISAPIError, ISAPIUnsupported
 from .transport import describe_error
 
@@ -105,9 +105,10 @@ class CallSourceMixin:
                 assert self._client is not None
                 async for event in self._client.async_iter_alerts(on_connect=_connected):
                     backoff = ALERT_BACKOFF_START
-                    state = call_state_from_event(event)
+                    received = dt_util.now()
+                    state = call_state_from_event(event, received)
                     if state is None:
-                        self._remember_panel_event(event)
+                        self._remember_panel_event(event, received)
                         continue
                     _LOGGER.debug(
                         "[%s] Событие панели: type=%s state=%s -> %s",
@@ -152,7 +153,7 @@ class CallSourceMixin:
             await asyncio.sleep(backoff)
 
     @callback
-    def _remember_panel_event(self, event: dict) -> None:
+    def _remember_panel_event(self, event: dict, received) -> None:
         """Нераспознанное событие — кратко в журнал и в атрибут panel_events.
 
         Раньше в журнал шли только type/state, и по «accesscontrollerevent
@@ -160,9 +161,13 @@ class CallSourceMixin:
         все короткие поля (без персональных), а владелец видит последние
         десять прямо в интерфейсе, без журнала. INFO — раз в 10 минут на
         сигнатуру, иначе DEBUG: терминал шлёт события на каждое лицо и карту.
+        События из памяти панели (догон истории) — всегда DEBUG.
         """
         got = self.panel_event_log.add(
-            event, time.monotonic(), dt_util.now().isoformat(timespec="seconds")
+            event,
+            time.monotonic(),
+            received.isoformat(timespec="seconds"),
+            history=is_history_event(event, received),
         )
         if got is None:
             return  # пульс потока

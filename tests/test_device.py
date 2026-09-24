@@ -417,13 +417,13 @@ class TestStreamFallback(DeviceTestCase):
         asyncio.run(main())
 
 
-def acs_part(sub: int) -> str:
+def acs_part(sub: int, extra: str = "") -> str:
     """Одна часть alertStream терминала: AccessControllerEvent в JSON."""
     return (
         "--MIME_boundary\r\nContent-Type: application/json; charset=\"UTF-8\"\r\n\r\n"
         '{"ipAddress":"192.168.70.121","eventType":"AccessControllerEvent",'
         '"eventState":"active","AccessControllerEvent":{"majorEventType":5,'
-        f'"subEventType":{sub},"name":"Иванов Иван","employeeNoString":"1007",'
+        f'"subEventType":{sub},{extra}"name":"Иванов Иван","employeeNoString":"1007",'
         '"pictureURL":"http://192.168.70.121/LOCALS/pic/1.jpg"}}\r\n'
     )
 
@@ -439,8 +439,10 @@ class TestPanelEventsAttribute(DeviceTestCase):
         def handler(request):
             if "alertStream" in request.url.path:
                 sent["n"] += 1
-                # Первое подключение — событие «лицо», второе — кнопка вызова.
-                body = acs_part(75) if sent["n"] == 1 else acs_part(0x25)
+                # Первое подключение — догон истории (старый «Вызов» 5/0x25
+                # с currentEvent=false) и «лицо», второе — настоящий вызов.
+                old = acs_part(0x25, '"currentEvent":false,')
+                body = old + acs_part(75) if sent["n"] == 1 else acs_part(0x25)
                 return httpx.Response(
                     200,
                     headers={"Content-Type": "multipart/mixed; boundary=MIME_boundary"},
@@ -458,8 +460,10 @@ class TestPanelEventsAttribute(DeviceTestCase):
             attrs = binary_sensor.CallBinarySensor(device).extra_state_attributes
             events = attrs["panel_events"]
             self.assertTrue(events)
-            # В атрибуте только нераспознанное (5/75), без персональных полей.
-            self.assertEqual({e["fields"]["subeventtype"] for e in events}, {"75"})
+            # В атрибуте только нераспознанное, без персональных полей; старый
+            # «Вызов» — там же с пометкой history, звонком он не стал.
+            self.assertEqual([(e["fields"]["subeventtype"], e.get("history"))
+                              for e in events], [("37", True), ("75", None)])
             for e in events:
                 for key in ("name", "employeenostring", "pictureurl"):
                     self.assertNotIn(key, e["fields"])

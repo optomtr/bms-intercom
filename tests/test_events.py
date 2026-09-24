@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timedelta, timezone
 
 from _loader import load
 
@@ -269,6 +270,61 @@ class TestPanelEventLog(unittest.TestCase):
         )
         self.assertIsNone(log.add(beat, 0.0, "t"))
         self.assertEqual(log.items, [])
+
+
+class TestHistoryEvents(unittest.TestCase):
+    """Терминал досылает по alertStream события из памяти (октябрь 2024):
+    старый «Вызов» из такого догона не должен открыть поп-ап."""
+
+    PANEL = datetime(2026, 9, 24, 10, 0, tzinfo=timezone(timedelta(hours=5)))
+
+    def state(self, event, after_seconds=None):
+        received = None
+        if after_seconds is not None:
+            received = self.PANEL + timedelta(seconds=after_seconds)
+        return events.call_state_from_event(event, received)
+
+    def test_history_call_does_not_ring(self):
+        for flag in (False, "false", "FALSE", " False ", 0, "0"):
+            with self.subTest(flag=flag):
+                old = acs_event(5, 0x33, currentEvent=flag)
+                self.assertIsNone(self.state(old))
+                self.assertIsNone(self.state(old, after_seconds=1))
+
+    def test_current_call_rings_even_if_the_panel_clock_lies(self):
+        now = acs_event(5, 0x33, currentEvent=True)
+        self.assertEqual(self.state(now), events.STATE_RINGING)
+        # Часы терминала отстают на год — флаг главнее.
+        self.assertEqual(self.state(now, 365 * 86400), events.STATE_RINGING)
+
+    def test_without_the_flag_an_old_datetime_is_history(self):
+        self.assertIsNone(self.state(acs_event(5, 0x33), after_seconds=121))
+
+    def test_without_the_flag_a_fresh_datetime_rings(self):
+        for age in (0, 30, 120, -3600):  # -3600: часы панели спешат
+            with self.subTest(age=age):
+                self.assertEqual(
+                    self.state(acs_event(5, 0x25), age), events.STATE_RINGING
+                )
+
+    def test_villa_panel_clock_is_not_trusted(self):
+        # videoIntercom историю не досылает, а пояс на панели часто кривой.
+        [start, _end] = events.AlertStreamParser().feed(CALL_START + CALL_END)
+        self.assertEqual(
+            self.state(start, 5 * 3600), events.STATE_RINGING
+        )
+
+    def test_history_is_logged_quietly_and_marked(self):
+        old = acs_event(5, 75, currentEvent=False)  # как пришло с объекта
+        self.assertTrue(events.is_history_event(old))
+        log = events.PanelEventLog()
+        line, loud = log.add(old, 0.0, "t", history=True)
+        self.assertFalse(loud)
+        self.assertIn("history=true", line)
+        self.assertIs(log.items[0]["history"], True)
+        # Догон не съедает INFO: первое настоящее событие сигнатуры — громкое.
+        self.assertTrue(log.add(acs_event(5, 75), 1.0, "t2")[1])
+        self.assertNotIn("history", log.items[1])
 
 
 if __name__ == "__main__":

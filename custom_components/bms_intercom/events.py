@@ -17,6 +17,7 @@ import logging
 import re
 import xml.etree.ElementTree as ET
 from collections import deque
+from datetime import datetime, timedelta
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -55,6 +56,16 @@ CALL_EVENT_TYPES = {
 ACS_EVENT_TYPE = "accesscontrollerevent"
 ACS_MAJOR_EVENT = 0x5
 ACS_CALL_MINORS = frozenset({0x25, 0x33})
+
+#: Терминал (DS-K1T341AM V3.2.30) после подключения к alertStream досылает
+#: СТАРЫЕ события из своей памяти (на объекте — за октябрь 2024) с
+#: currentEvent=false. Старое «Вызов» в таком догоне не должно открыть поп-ап.
+#: Если флага нет — судим по времени события (dateTime панели), но только для
+#: событий терминала доступа: вилла-панели историю не досылают, а часы/пояс у
+#: них часто выставлены криво — проверка возраста там молча убила бы звонок.
+HISTORY_MAX_AGE = timedelta(minutes=2)
+_WORDS_FALSE = frozenset({"false", "0", "no", "off"})
+_WORDS_TRUE = frozenset({"true", "1", "yes", "on"})
 
 #: Exact status words, lowercased.
 _EXACT = {
@@ -288,8 +299,46 @@ def is_acs_call(event: dict[str, Any]) -> bool:
     )
 
 
-def call_state_from_event(event: dict[str, Any] | None) -> str | None:
-    """Map one parsed event to idle/ringing/answered, or None if unrelated."""
+def _panel_time(raw: str) -> datetime | None:
+    """dateTime панели; без часового пояса — None (не с чем сравнивать)."""
+    try:
+        stamp = datetime.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
+
+
+def is_history_event(event: dict[str, Any], received: datetime | None = None) -> bool:
+    """Событие из памяти панели, а не то, что происходит сейчас.
+
+    Главный признак — явный currentEvent: часам терминала верить нельзя.
+    Возраст (received − dateTime > HISTORY_MAX_AGE) — только когда флага нет,
+    время известно и это событие терминала доступа (см. HISTORY_MAX_AGE).
+    """
+    fields = event.get("fields", {})
+    flag = str(fields.get("currentevent", "")).strip().lower()
+    if flag in _WORDS_FALSE:
+        return True
+    if flag in _WORDS_TRUE or received is None or received.tzinfo is None:
+        return False
+    if event.get("type", "") != ACS_EVENT_TYPE:
+        return False
+    stamp = _panel_time(fields.get("datetime", ""))
+    # Время панели «из будущего» (часы спешат) — не история.
+    return stamp is not None and received - stamp > HISTORY_MAX_AGE
+
+
+def call_state_from_event(
+    event: dict[str, Any] | None, received: datetime | None = None
+) -> str | None:
+    """Map one parsed event to idle/ringing/answered, or None if unrelated.
+
+    `received` — когда событие пришло к нам (для проверки возраста); без него
+    история отсекается только по флагу currentEvent.
+    """
+    if event and is_history_event(event, received):
+        # Прошлое не говорит о том, что сейчас: ни звонка, ни его конца.
+        return None
     if event and is_acs_call(event):
         # Разовое событие: «конца звонка» терминал не присылает, сброс делают
         # окно звонка и таймер вызова (callsource).
@@ -380,24 +429,28 @@ class PanelEventLog:
         self._last_info: dict[str, float] = {}
 
     def add(
-        self, event: dict[str, Any], now: float, stamp: str
+        self, event: dict[str, Any], now: float, stamp: str, history: bool = False
     ) -> tuple[str, bool] | None:
         """Запомнить событие -> (строка для журнала, писать ли на INFO).
 
-        None — пульс потока, ничего не запомнено.
+        None — пульс потока, ничего не запомнено. history — событие из памяти
+        панели: в атрибут идёт с пометкой, в журнал всегда тихо (догон бывает
+        тысячами) и не тратит INFO-квоту своей сигнатуры.
         """
         if is_heartbeat(event):
             return None
-        item = {
+        item: dict[str, Any] = {
             "time": stamp,
             "type": event.get("type", ""),
             "state": event.get("state", ""),
             "fields": panel_event_fields(event),
         }
+        if history:
+            item["history"] = True
         self._items.append(item)
         sig = panel_event_signature(event)
         last = self._last_info.get(sig)
-        loud = last is None or now - last >= self._info_every
+        loud = not history and (last is None or now - last >= self._info_every)
         if loud:
             self._last_info[sig] = now
             if len(self._last_info) > 256:  # сигнатуры не должны копиться вечно
@@ -407,6 +460,7 @@ class PanelEventLog:
                 }
         line = " ".join(
             [f"type={item['type']}", f"state={item['state']}"]
+            + (["history=true"] if history else [])
             + [f"{k}={v}" for k, v in item["fields"].items()]
         )
         return line, loud
