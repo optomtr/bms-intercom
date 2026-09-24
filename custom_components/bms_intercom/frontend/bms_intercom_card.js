@@ -32,10 +32,24 @@
   // currentScript.src gives HA's origin and the ringtone/snapshot load from HA
   // instead of resolving to a broken file:/// URL.
   let SELF_ORIGIN = "";
+  let SELF_SRC = "";
   try {
-    const _src = (document.currentScript && document.currentScript.src) || "";
-    if (_src) SELF_ORIGIN = new URL(_src).origin;
+    SELF_SRC = (document.currentScript && document.currentScript.src) || "";
+    if (SELF_SRC) SELF_ORIGIN = new URL(SELF_SRC).origin;
   } catch (e) { /* keep relative */ }
+  // Своя версия = ?v= из URL, с которого загружен ЭТОТ файл (md5 карточки).
+  // Классический <script> даёт currentScript.src. У ES-модуля (так фронтенд HA
+  // грузит extra_module_url) currentScript = null, а import.meta в файле писать
+  // нельзя: в классическом <script> киоска это SyntaxError, и поп-ап не
+  // загрузился бы вовсе. Поэтому URL модуля берём из стека: пока файл
+  // исполняется, верхний кадр стека — он сам. Версии нет → автообновление выкл.
+  function ownCardVersion() {
+    let where = SELF_SRC;
+    if (!where) { try { where = String(new Error().stack || ""); } catch (e) { /* нет стека */ } }
+    const m = /bms_intercom_card\.js\?(?:[^\s)'"#]*&)?v=([0-9A-Za-z_-]+)/.exec(where);
+    return m ? m[1] : "";
+  }
+  const CARD_VERSION = ownCardVersion();
   const assetUrl = (path) => SELF_ORIGIN + path;
   const POLL_MS = 400;
   const FEATURE_STREAM = 2; // CameraEntityFeature.STREAM
@@ -101,6 +115,7 @@
       if (a.intercom_https_port) g.httpsPort = a.intercom_https_port;
       if (a.talk_supported) g.talkSupported = a.talk_supported;
       if (a.talk_hint) g.talkHint = a.talk_hint;
+      if (a.intercom_card_version) g.cardVersion = a.intercom_card_version;
       if (a.intercom_role === "call") {
         g.callState = a.call_state || (st.state === "on" ? "ringing" : "idle");
       }
@@ -797,9 +812,57 @@
     }
   }
 
+  // --- Автообновление устаревшей карточки -----------------------------------
+  // После обновления интеграции открытые вкладки и планшеты держат уже
+  // загруженный старый JS (на объекте старая вкладка играла ring1.mp3, новая —
+  // velvet, одновременно). Интеграция кладёт в атрибут intercom_card_version тот
+  // же хэш, что в ?v= URL карточки; чужой хэш → перезагрузить страницу, но только
+  // в непрерывном простое: звонок, разговор и просмотр не рвём никогда.
+  const STALE_IDLE_MS = 5000;
+  const RELOAD_GUARD_MS = 10 * 60 * 1000;
+  const RELOAD_KEY = "bms_intercom_card_reload";
+  let RELOAD_ENABLED = false;
+  try { RELOAD_ENABLED = !!CARD_VERSION && location.protocol !== "file:"; } catch (e) { /* выкл */ }
+  let staleSince = 0;
+  let reloadTriedAt = 0; // страж в памяти: единственный, если sessionStorage закрыт
+
+  function staleTarget(groups) {
+    for (const g of Object.values(groups)) {
+      if (g.cardVersion && g.cardVersion !== CARD_VERSION) return g.cardVersion;
+    }
+    return null;
+  }
+
+  // Защита от петли: если и после reload версия чужая (кэш, прокси), страница не
+  // должна перезагружаться каждые 5 с — одна попытка на целевую версию за 10 мин.
+  function reloadAllowed(target, now) {
+    if (reloadTriedAt && Math.abs(now - reloadTriedAt) < RELOAD_GUARD_MS) return false;
+    let prev = null;
+    try { prev = JSON.parse(window.sessionStorage.getItem(RELOAD_KEY) || "null"); } catch (e) { /* закрыт или мусор */ }
+    if (prev && prev.v === target && Math.abs(now - prev.t) < RELOAD_GUARD_MS) return false;
+    try { window.sessionStorage.setItem(RELOAD_KEY, JSON.stringify({ v: target, t: now })); } catch (e) { /* закрыт — хватит памяти */ }
+    reloadTriedAt = now;
+    return true;
+  }
+
+  function checkStaleCard(groups) {
+    const target = RELOAD_ENABLED ? staleTarget(groups) : null;
+    const busy = currentMode !== null || (overlay && overlay.classList.contains("show"));
+    if (!target || busy) { staleSince = 0; return; }
+    const now = Date.now();
+    if (!staleSince) { staleSince = now; return; }
+    if (now - staleSince < STALE_IDLE_MS) return;
+    staleSince = 0;
+    if (!reloadAllowed(target, now)) return;
+    // eslint-disable-next-line no-console
+    console.info(`BMS Intercom: карточка ${CARD_VERSION} устарела (в HA ${target}) — перезагружаю страницу`);
+    location.reload();
+  }
+
   function tick() {
     const hass = getHass();
-    if (!hass) return;
+    // Состояний не видно (загрузка, переподключение) — простой не доказан.
+    if (!hass) { staleSince = 0; return; }
     if (!overlay) buildOverlay();
 
     const groups = groupIntercoms(hass);
@@ -815,7 +878,8 @@
         if (g.viewOn) { pick = [id, g]; pickMode = "idle"; break; }
       }
     }
-    if (!pick) { if (lastSig !== null) hide(); return; }
+    if (!pick) { if (lastSig !== null) hide(); checkStaleCard(groups); return; }
+    staleSince = 0;
     // Вердикт talk_supported может прийти посреди звонка — кнопку правим всегда.
     applyTalkSupport(pick[1]);
 
@@ -864,7 +928,7 @@
   });
 
   if (window.__BMS_INTERCOM_TEST__) {
-    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick, callRole, toggleMic, duckInit, duckStep, DUCK };
+    window.__BMS_INTERCOM_TEST__.api = { groupIntercoms, getHass, tick, safeTick, callRole, toggleMic, duckInit, duckStep, DUCK, CARD_VERSION };
   }
 
   // eslint-disable-next-line no-console

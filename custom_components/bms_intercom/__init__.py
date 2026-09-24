@@ -1,7 +1,6 @@
 """The BMS Intercom integration."""
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 
@@ -24,6 +23,7 @@ from .const import (
     SERVICE_PROBE,
 )
 from .callsource import _SKIP_RELOAD
+from .cardversion import CARD_FILE, load_card_version
 from .device import BMSIntercomDevice
 from .proxy import HTTPSProxy
 from .talkback import decode_talk_chunk
@@ -34,7 +34,6 @@ _PROXY_KEY = f"{DOMAIN}_https_proxy"
 _FRONTEND_FLAG = f"{DOMAIN}_frontend_registered"
 _WS_FLAG = f"{DOMAIN}_ws_registered"
 _STATIC_URL = f"/{DOMAIN}_static"
-_CARD_FILE = "bms_intercom_card.js"
 
 
 # --- микрофон оператора: WebSocket-команды (из форка) ------------------------
@@ -92,20 +91,6 @@ def _async_register_ws(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, _ws_talk_stop)
 
 
-def _card_version() -> str:
-    """Метка кэша = md5 самого файла карточки (из форка).
-
-    Ручной номер версии забывали поднимать — браузеры держали старый поп-ап.
-    Хэш содержимого меняется с каждой правкой сам; хватает перезапуска HA.
-    """
-    path = os.path.join(os.path.dirname(__file__), "frontend", _CARD_FILE)
-    try:
-        with open(path, "rb") as fh:
-            return hashlib.md5(fh.read()).hexdigest()[:10]
-    except OSError:
-        return "dev"
-
-
 async def _async_register_frontend(hass: HomeAssistant) -> None:
     """Serve and auto-load the bundled popup module (once per HA run)."""
     if hass.data.get(_FRONTEND_FLAG):
@@ -115,8 +100,9 @@ async def _async_register_frontend(hass: HomeAssistant) -> None:
     await hass.http.async_register_static_paths(
         [StaticPathConfig(_STATIC_URL, frontend_dir, False)]
     )
-    version = await hass.async_add_executor_job(_card_version)
-    card_url = f"{_STATIC_URL}/{_CARD_FILE}?v={version}"
+    # Метка кэша = md5 файла (cardversion); она же уходит в атрибут сущностей.
+    version = await hass.async_add_executor_job(load_card_version)
+    card_url = f"{_STATIC_URL}/{CARD_FILE}?v={version}"
     add_extra_js_url(hass, card_url)
     _LOGGER.debug("Поп-ап домофона зарегистрирован: %s", card_url)
 

@@ -311,6 +311,140 @@ async function duckWired() {
   return r;
 }
 
+// 13. Автообновление устаревшей карточки (0.3.10). Каждый сценарий — свежий
+// экземпляр карточки: своя версия читается один раз при загрузке файла.
+const CARD_URL = "http://ha.local:8123/bms_intercom_static/bms_intercom_card.js?v=";
+function memStorage() {
+  const m = {};
+  return { getItem(k) { return k in m ? m[k] : null; }, setItem(k, v) { m[k] = String(v); } };
+}
+function freshCard({ script = "", filename, protocol = "http:", storage, now = 1.7e12 } = {}) {
+  const env = { now, reloads: 0, infos: [], warns: 0 };
+  env.hass = { states: {}, callService() {},
+    connection: { sendMessagePromise() { return new Promise(() => {}); },
+                  subscribeMessage() { return Promise.resolve(() => {}); } } };
+  const win = { __BMS_INTERCOM_TEST__: {}, isSecureContext: true, customCards: [] };
+  if (storage === "throws") {
+    Object.defineProperty(win, "sessionStorage", { get() { throw new Error("SecurityError"); } });
+  } else if (storage) {
+    win.sessionStorage = storage;
+  }
+  const box = {
+    __env: env, window: win,
+    document: {
+      currentScript: script ? { src: script } : null,
+      querySelector(sel) { return sel === "home-assistant" ? { hass: env.hass } : null; },
+      createElement() { return fakeElement(); },
+      body: { appendChild() {} },
+    },
+    customElements: { get() { return undefined; }, define() {} },
+    HTMLElement: class {}, Audio: function () { return fakeElement(); },
+    setInterval() { return 0; }, clearInterval() {}, setTimeout() { return 1; }, clearTimeout() {},
+    MediaStream, RTCPeerConnection,
+    location: { protocol, hostname: "ha.local", port: "8123", pathname: "/", search: "", hash: "",
+                reload() { env.reloads += 1; } },
+    navigator: { mediaDevices: { getUserMedia() { return new Promise(() => {}); } } },
+    console: { info(...a) { env.infos.push(String(a[0])); }, debug() {}, log() {},
+               warn() { env.warns += 1; }, error() { env.warns += 1; } },
+  };
+  win.document = box.document;
+  vm.createContext(box);
+  vm.runInContext("Date.now = function () { return __env.now; };", box);
+  vm.runInContext(src, box, filename ? { filename } : undefined);
+  env.api = win.__BMS_INTERCOM_TEST__.api;
+  // Состояния домофона r1: версия карточки в HA, фаза вызова, «Просмотр».
+  env.set = (ver, callState = "idle", view = false) => {
+    const a = { intercom_id: "r1", intercom_name: "Домофон" };
+    if (ver) a.intercom_card_version = ver;
+    env.hass.states = {
+      "binary_sensor.r1_vyzov": { entity_id: "binary_sensor.r1_vyzov",
+        state: callState === "idle" ? "off" : "on",
+        attributes: { ...a, intercom_role: "call", call_state: callState } },
+      "switch.r1_view": { entity_id: "switch.r1_view", state: view ? "on" : "off",
+        attributes: { ...a, intercom_role: "view" } },
+    };
+  };
+  // Цикл поп-апа каждые 400 мс, как в браузере.
+  env.run = (ms) => { for (let t = 0; t < ms; t += 400) { env.now += 400; env.api.safeTick(); } return env.reloads; };
+  env.reloadLines = () => env.infos.filter((l) => l.includes("перезагружаю")).length;
+  return env;
+}
+attempt("stale_reload_once", () => {
+  const c = freshCard({ script: CARD_URL + "old111", storage: memStorage() });
+  c.set("new222");
+  c.api.safeTick();                    // первый цикл простоя — отсчёт пошёл
+  const early = c.run(4400);           // 4,4 с — рано
+  const at5 = c.run(1200);             // перевалило за 5 с
+  const later = c.run(60000);          // страница «не ушла» — второй попытки нет
+  return { version: c.api.CARD_VERSION, early, at5, later, lines: c.reloadLines(), warns: c.warns };
+});
+attempt("stale_busy_never", () => {
+  const r = {};
+  for (const [name, st, view] of [["ringing", "ringing", false], ["answered", "answered", false],
+                                  ["view", "idle", true]]) {
+    const c = freshCard({ script: CARD_URL + "old111", storage: memStorage() });
+    c.set("new222", st, view);
+    r[name] = c.run(60000);
+    if (name === "ringing") {
+      c.set("new222");                 // звонок кончился: простой считается заново
+      r.afterCallEarly = c.run(4400);
+      r.afterCall = c.run(1200);
+    }
+  }
+  return r;
+});
+attempt("stale_same_version", () => {
+  const c = freshCard({ script: CARD_URL + "same333", storage: memStorage() });
+  c.set("same333");
+  return c.run(60000);
+});
+attempt("stale_repeat_guard", () => {
+  const store = memStorage();
+  const first = freshCard({ script: CARD_URL + "old111", storage: store });
+  first.set("new222");
+  const r = { first: first.run(6000) };
+  // Перезагрузка отдала всё тот же старый файл (кэш/прокси): новая страница,
+  // та же вкладка (sessionStorage), та же целевая версия — не крутимся.
+  const again = freshCard({ script: CARD_URL + "old111", storage: store, now: first.now + 30000 });
+  again.set("new222");
+  r.again = again.run(60000);
+  const late = freshCard({ script: CARD_URL + "old111", storage: store, now: first.now + 11 * 60000 });
+  late.set("new222");
+  r.after10min = late.run(6000);
+  const next = freshCard({ script: CARD_URL + "old111", storage: store, now: late.now + 60000 });
+  next.set("new444");                  // ещё одно обновление — новая цель
+  r.newTarget = next.run(6000);
+  return r;
+});
+attempt("stale_no_storage", () => {
+  const c = freshCard({ script: CARD_URL + "old111", storage: "throws" });
+  c.set("new222");
+  return { first: c.run(6000), in9min: c.run(9 * 60000), warns: c.warns };
+});
+attempt("stale_unknown_version", () => {
+  const plain = freshCard({ storage: memStorage() });            // ни currentScript, ни ?v= в стеке
+  plain.set("new222");
+  const noV = freshCard({ script: "http://ha.local:8123/bms_intercom_static/bms_intercom_card.js",
+                          storage: memStorage() });
+  noV.set("new222");
+  const kiosk = freshCard({ script: CARD_URL + "old111", protocol: "file:", storage: memStorage() });
+  kiosk.set("new222");
+  return { plain: plain.run(60000), plainVersion: plain.api.CARD_VERSION,
+           noV: noV.run(60000), kiosk: kiosk.run(60000) };
+});
+attempt("stale_module_url_from_stack", () => {
+  // ES-модуль: currentScript = null, свой URL — только в стеке исполнения.
+  const c = freshCard({ filename: CARD_URL + "mod777", storage: memStorage() });
+  c.set("new222");
+  return { version: c.api.CARD_VERSION, reloads: c.run(6000) };
+});
+attempt("stale_attr_missing", () => {
+  // Старая интеграция без атрибута — карточка не трогает страницу.
+  const c = freshCard({ script: CARD_URL + "old111", storage: memStorage() });
+  c.set("");
+  return c.run(60000);
+});
+
 (async () => {
   try { out.duck_wired = { ok: true, value: await duckWired() }; }
   catch (e) { out.duck_wired = { ok: false, error: String((e && e.stack) || e) }; }

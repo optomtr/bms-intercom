@@ -10,11 +10,31 @@ Run: python3 -m unittest discover -s tests -v   (skipped when node is absent)
 """
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import shutil
 import subprocess
 import unittest
 from pathlib import Path
+from unittest import mock
+from urllib.parse import parse_qs, urlparse
+
+try:
+    import homeassistant  # noqa: F401
+    HAVE_HA = True
+except ImportError:  # pragma: no cover
+    HAVE_HA = False
+
+from _loader import SRC, load
+
+if HAVE_HA:
+    integration = load("__init__")
+    cardversion = load("cardversion")
+    entity_mod = load("entity")
+    from test_device import DeviceTestCase
+else:  # pragma: no cover
+    DeviceTestCase = unittest.TestCase
 
 HARNESS = Path(__file__).resolve().parent / "js" / "card_harness.js"
 NODE = shutil.which("node")
@@ -109,10 +129,96 @@ class TestPopupCard(unittest.TestCase):
         self.assertEqual(got["warnings"], 0)
         self.assertFalse(got["noWebAudioMuted"], "без WebAudio звук панели пропал")
 
+    # --- 0.3.10: вкладка со старым JS перезагружается сама ------------------
+    def test_stale_card_reloads_once_after_5s_idle(self):
+        """На объекте старая вкладка играла ring1.mp3, новая — velvet, разом."""
+        self.assertEqual(self.assertSurvives("stale_reload_once"),
+                         {"version": "old111", "early": 0, "at5": 1, "later": 1,
+                          "lines": 1, "warns": 0})
+
+    def test_stale_card_never_reloads_during_a_call_or_view(self):
+        """Звонок, разговор, просмотр — никогда; после звонка 5 с отсчёта заново."""
+        self.assertEqual(self.assertSurvives("stale_busy_never"),
+                         {"ringing": 0, "answered": 0, "view": 0,
+                          "afterCallEarly": 0, "afterCall": 1})
+
+    def test_same_version_does_not_reload(self):
+        self.assertEqual(self.assertSurvives("stale_same_version"), 0)
+
+    def test_attribute_missing_does_not_reload(self):
+        self.assertEqual(self.assertSurvives("stale_attr_missing"), 0)
+
+    def test_same_target_within_10_min_is_not_retried(self):
+        """Reload отдал тот же старый файл — не петля; новая цель или 10 мин — можно."""
+        self.assertEqual(self.assertSurvives("stale_repeat_guard"),
+                         {"first": 1, "again": 0, "after10min": 1, "newTarget": 1})
+
+    def test_without_session_storage_memory_guard_holds(self):
+        self.assertEqual(self.assertSurvives("stale_no_storage"),
+                         {"first": 1, "in9min": 1, "warns": 0})
+
+    def test_unknown_own_version_or_kiosk_never_reloads(self):
+        self.assertEqual(self.assertSurvives("stale_unknown_version"),
+                         {"plain": 0, "plainVersion": "", "noV": 0, "kiosk": 0})
+
+    def test_es_module_finds_its_version_without_current_script(self):
+        """Фронтенд HA грузит карточку модулем: currentScript = null."""
+        self.assertEqual(self.assertSurvives("stale_module_url_from_stack"),
+                         {"version": "mod777", "reloads": 1})
+
     def test_a_failing_tick_is_logged_once_not_every_400ms(self):
         self.assertSurvives("safe_tick_swallows")
         self.assertEqual(self.out["warnings"], 1)
         self.assertEqual(self.out["errors"], 0)
+
+
+class _FrontendHass:
+    """Ровно то, что трогает _async_register_frontend."""
+
+    def __init__(self):
+        self.data = {}
+
+        class _Http:
+            async def async_register_static_paths(self, paths):
+                return None
+
+        self.http = _Http()
+
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+@unittest.skipUnless(HAVE_HA, "Home Assistant not installed")
+class TestCardVersionAttribute(DeviceTestCase):
+    def setUp(self):
+        super().setUp()
+        self._saved_version = cardversion._version
+        cardversion._version = None
+        self._saved_add = integration.add_extra_js_url
+
+    def tearDown(self):
+        integration.add_extra_js_url = self._saved_add
+        cardversion._version = self._saved_version
+        super().tearDown()
+
+    def attrs(self, device):
+        return entity_mod.BMSIntercomEntity(device, "k").intercom_attributes
+
+    def test_attribute_equals_the_hash_in_the_card_url(self):
+        device, _hass, _entry = self.make_device()
+        # До регистрации фронтенда метки нет — атрибута нет, карточка молчит.
+        self.assertNotIn("intercom_card_version", self.attrs(device))
+        urls = []
+        integration.add_extra_js_url = lambda hass, url: urls.append(url)
+        asyncio.run(integration._async_register_frontend(_FrontendHass()))
+        self.assertEqual(len(urls), 1)
+        url_version = parse_qs(urlparse(urls[0]).query)["v"][0]
+        body = (SRC / "frontend" / "bms_intercom_card.js").read_bytes()
+        self.assertEqual(url_version, hashlib.md5(body).hexdigest()[:10])
+        # Атрибут пишется на каждый state — файл при этом больше не читается.
+        with mock.patch("builtins.open", side_effect=AssertionError("файл читается на state")):
+            got = self.attrs(device)
+        self.assertEqual(got["intercom_card_version"], url_version)
 
 
 if __name__ == "__main__":
