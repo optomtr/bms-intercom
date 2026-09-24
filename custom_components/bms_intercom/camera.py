@@ -14,8 +14,10 @@ import time
 from homeassistant.components.camera import (
     Camera,
     CameraEntityFeature,
+    async_get_image,
     async_get_still_stream,
 )
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -23,9 +25,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from .const import DOMAIN
 from .device import STATE_ANSWERED, STATE_RINGING, BMSIntercomDevice
 from .entity import BMSIntercomEntity
+from .stream_frames import make_stream_frame_source
 
 _FRAME_W, _FRAME_H = 640, 480
 _DEMO_FPS_INTERVAL = 0.2  # 5 fps is plenty for a placeholder stream
+
 
 
 async def async_setup_entry(
@@ -81,15 +85,39 @@ class IntercomCamera(BMSIntercomEntity, Camera):
         return await self.device.async_snapshot()
 
     async def handle_async_mjpeg_stream(self, request):
-        """Demo mode streams generated frames; real mode falls back to HA."""
-        if not self.device.is_demo:
+        """Кадры для <img>-потока: демо рисует свои, панель отдаёт из RTSP.
+
+        Мина, из-за которой на планшете при звонке не было видно НИЧЕГО:
+        ``/api/camera_proxy_stream`` зовёт ``async_camera_image`` напрямую, а
+        она у панели без снимка возвращает ``None`` — поток обрывался сразу,
+        отдав ноль байт при честном HTTP 200. ``use_stream_for_stills``, из-за
+        которого одиночный снимок работает, в этом пути Home Assistant не
+        участвует вовсе. Берём кадры тем же путём, что и снимок.
+        """
+        if self.device.is_demo:
+
+            async def _demo_cb() -> bytes:
+                return await self.hass.async_add_executor_job(self._render_demo_frame)
+
+            return await async_get_still_stream(
+                request, _demo_cb, self.content_type, _DEMO_FPS_INTERVAL
+            )
+
+        if not self.use_stream_for_stills:
             return await super().handle_async_mjpeg_stream(request)
 
-        async def _image_cb() -> bytes:
-            return await self.hass.async_add_executor_job(self._render_demo_frame)
+        async def _grab() -> bytes | None:
+            try:
+                image = await async_get_image(self.hass, self.entity_id)
+            except (HomeAssistantError, TimeoutError):
+                return None
+            return image.content or None
 
         return await async_get_still_stream(
-            request, _image_cb, self.content_type, _DEMO_FPS_INTERVAL
+            request,
+            make_stream_frame_source(_grab),
+            self.content_type,
+            self.frame_interval,
         )
 
     # --- Demo frame rendering ---------------------------------------------
