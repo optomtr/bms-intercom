@@ -59,6 +59,13 @@ MAX_TALK_SECONDS = 180
 #: вызов через секунду (нет интернета → не достучалась до Hik-Connect):
 #: оператор должен успеть увидеть поп-ап и ответить.
 RING_WINDOW_SECONDS = 25
+#: После того как оператор завершил вызов («Сбросить»; авто-завершение карточки
+#: после «Открыть» — тот же «Сбросить»), ring/answered от панели (опрос или
+#: поток) столько секунд НЕ открывает вызов заново. Иначе опрос, который ещё
+#: видит ring (терминал не успел бросить вызов или перезванивает), засчитывал
+#: его как новый звонок с новым окном — «Сбросить» → поп-ап снова, по кругу
+#: (было в форке, а с постоянным опросом появилось бы и у нас).
+HANGUP_QUIET_SECONDS = 15
 
 
 class CallSourceMixin:
@@ -67,6 +74,8 @@ class CallSourceMixin:
     #: У модели нет callStatus (ISAPIUnsupported) — опрос больше не заводим,
     #: даже когда поток событий упал: он бы только сыпал предупреждениями.
     _poll_unsupported = False
+    #: До этого момента (monotonic) звонок от панели не открывает вызов.
+    _ring_quiet_until = 0.0
 
     def _start_alert_stream(self) -> None:
         if self._alert_task is None or self._alert_task.done():
@@ -264,6 +273,12 @@ class CallSourceMixin:
         Действия оператора в HA идут мимо — прямо в _apply_call_state.
         """
         now = time.monotonic()
+        if new_state != STATE_IDLE and now < self._ring_quiet_until:
+            _LOGGER.debug(
+                "[%s] %s от панели сразу после «Сбросить» — не новый вызов",
+                self.name, new_state,
+            )
+            return
         if self._test_call:
             # Запасной тестовый вызов (testcall.py) живёт только в HA: у панели
             # звонка нет, и опрос каждую секунду честно говорит idle. Это idle
@@ -290,6 +305,11 @@ class CallSourceMixin:
                 self._arm_call_timeout(left)
                 return
         self._apply_call_state(new_state)
+
+    @callback
+    def _operator_ended_call(self) -> None:
+        """Оператор завершил вызов: см. HANGUP_QUIET_SECONDS."""
+        self._ring_quiet_until = time.monotonic() + HANGUP_QUIET_SECONDS
 
     @callback
     def _apply_call_state(self, new_state: str) -> None:

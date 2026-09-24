@@ -57,6 +57,8 @@ class CallTestMixin:
             self._report_test_call("не начат: уже идёт вызов")
             return
         self._test_call_busy = True
+        # Оператор сам просит звонок: тишина после «Сбросить» ему не мешает.
+        self._ring_quiet_until = 0.0
         try:
             reason = await self._async_try_real_call()
         finally:

@@ -379,6 +379,8 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin):
         # В демо панели нет — демо ведёт себя как раньше.
         self._answered = new_state == STATE_ANSWERED and not self.is_demo
         self._answered_at = time.monotonic()
+        if new_state == STATE_IDLE:
+            self._operator_ended_call()
         self._apply_call_state(new_state)
 
     async def async_open_door(self) -> None:

@@ -22,6 +22,7 @@ if HAVE_HA:
     from test_ds_k1t341am import Panel
 
     callsource = load("callsource")
+    device_mod = load("device")
 
 
 class ClockedCase(DeviceTestCase):
@@ -30,9 +31,10 @@ class ClockedCase(DeviceTestCase):
     def setUp(self):
         super().setUp()
         self.clock = 1000.0
-        saved = callsource.time
-        callsource.time = types.SimpleNamespace(monotonic=lambda: self.clock)
-        self.addCleanup(setattr, callsource, "time", saved)
+        fake = types.SimpleNamespace(monotonic=lambda: self.clock)
+        for module in (callsource, device_mod):
+            self.addCleanup(setattr, module, "time", module.time)
+            module.time = fake
 
     def silent_stream_panel(self, panel):
         """Поток событий подключается и молчит, как у терминала на объекте."""
@@ -81,6 +83,58 @@ class TestShortRingWithStream(ClockedCase):
             await self.shutdown(device, entry)
 
         asyncio.run(main())
+
+
+class TestNoRingAgainAfterHangUp(ClockedCase):
+    """На объекте: «Сбросить» → поп-ап тут же снова «Входящий вызов», по кругу.
+    Опрос ещё видел ring и засчитывал его как новый звонок."""
+
+    def run_poll_device(self, scenario):
+        self.panel = Panel("idle")
+        self.use_panel(self.panel)
+
+        async def main():
+            device, _hass, entry = self.make_device(options={"use_alert_stream": False})
+            await device.async_setup()
+            await self.poll_at(0, "ring")
+            self.assertEqual(device.call_state, "ringing")
+            await scenario(device)
+            await self.shutdown(device, entry)
+
+        asyncio.run(main())
+
+    async def assert_ring_is_ignored_then_a_new_call_works(self, device):
+        for second in (6, 7, 8):                   # панель ещё звонит
+            await self.poll_at(second, "ring")
+            self.assertEqual(device.call_state, "idle", f"поп-ап вернулся на {second} с")
+        device._apply_panel_state("ringing")       # и из потока — тоже нет
+        self.assertEqual(device.call_state, "idle")
+        await self.poll_at(9, "idle")
+        await self.poll_at(25, "ring")             # новый посетитель через 20 с
+        self.assertEqual(device.call_state, "ringing", "новый звонок не открылся")
+
+    def test_reject_then_the_panel_still_rings(self):
+        async def scenario(device):
+            self.clock = 1005.0
+            await device.async_reject()
+            self.assertEqual(device.call_state, "idle")
+            await self.assert_ring_is_ignored_then_a_new_call_works(device)
+
+        self.run_poll_device(scenario)
+
+    def test_door_opened_then_the_card_ends_the_call(self):
+        async def scenario(device):
+            # Карточка: «Открыть» во время звонка = ответ + дверь, через 5 с
+            # сама жмёт «Сбросить».
+            await device.async_answer()
+            await device.async_open_door()
+            self.assertEqual(self.panel.door_opened, 1)
+            self.clock = 1005.0
+            await device.async_reject()
+            self.assertEqual(device.call_state, "idle")
+            await self.assert_ring_is_ignored_then_a_new_call_works(device)
+
+        self.run_poll_device(scenario)
 
 
 if __name__ == "__main__":
