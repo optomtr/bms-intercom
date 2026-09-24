@@ -217,6 +217,42 @@ done:
     return NULL;
 }
 
+/* Кадр S постоянного режима: {"channel":N}; пустой payload или {} — канал 1.
+   NULL — ок; иначе текст ошибки (помощник не выходит — ошибка только этого кадра). */
+static const char *parse_voice(const char *s, size_t len, int *channel)
+{
+    jcur c = {s, s + len};
+    char key[32];
+    long v;
+
+    *channel = 1;
+    j_ws(&c);
+    if (c.p == c.e) return NULL;
+    if (*c.p++ != '{') return "S: ожидался JSON-объект";
+    j_ws(&c);
+    if (c.p < c.e && *c.p == '}') { c.p++; goto done; }
+    for (;;) {
+        j_ws(&c);
+        if (j_str(&c, key, sizeof key)) return "S: неверный JSON (ключ)";
+        j_ws(&c);
+        if (c.p >= c.e || *c.p++ != ':') return "S: неверный JSON (нет ':')";
+        j_ws(&c);
+        if (!strcmp(key, "channel")) {
+            if (j_int(&c, &v) || v < 1 || v > 255) return "S: channel должен быть целым 1..255";
+            *channel = (int)v;
+        } else if (j_skip(&c)) {
+            return "S: неверный JSON (значение)";
+        }
+        j_ws(&c);
+        if (c.p < c.e && *c.p == ',') { c.p++; continue; }
+        if (c.p < c.e && *c.p == '}') { c.p++; break; }
+        return "S: неверный JSON (нет ',' или '}')";
+    }
+done:
+    j_ws(&c);
+    return c.p == c.e ? NULL : "S: лишние символы после JSON";
+}
+
 /* Экранировать строку для JSON-ответа (кавычки, обратная косая, управляющие символы). */
 static void json_escape(char *dst, size_t cap, const char *s)
 {

@@ -83,6 +83,17 @@ typedef struct {
 typedef void (*fVoiceDataCallBack)(LONG lVoiceComHandle, char *pRecvDataBuffer, DWORD dwBufSize,
                                    BYTE byAudioFlag, void *pUser);
 
+/* NET_DVR_SetExceptionCallBack_V30: SDK сообщает из своего потока, что связь с терминалом
+   пропала/вернулась или голос оборвался. Нужен постоянному режиму (serve.h): вход живёт часами. */
+typedef void (*fExceptionCallBack)(DWORD dwType, LONG lUserID, LONG lHandle, void *pUser);
+enum {
+    HIK_EXCEPTION_EXCHANGE = 0x8000,      /* пропал пульс с терминалом */
+    HIK_EXCEPTION_AUDIOEXCHANGE = 0x8001, /* оборвался голосовой сеанс (lHandle — его номер) */
+    HIK_RESUME_EXCHANGE = 0x8017,         /* пульс вернулся */
+    HIK_EXCEPTION_RELOGIN = 0x8040,       /* SDK сам входит заново */
+    HIK_RELOGIN_SUCCESS = 0x8041,         /* ...и вошёл */
+};
+
 /* NET_DVR_SetSDKInitCfg: где лежат компоненты HCNetSDKCom/ и OpenSSL — до NET_DVR_Init. */
 enum { NET_SDK_INIT_CFG_SDK_PATH = 2, NET_SDK_INIT_CFG_LIBEAY_PATH = 3, NET_SDK_INIT_CFG_SSLEAY_PATH = 4 };
 

@@ -20,6 +20,7 @@
  *      3 — ошибка входа/старта (JSON error уже выдан), 4 — связь с терминалом потеряна в разговоре.
  *   Свои коды ошибок (не SDK): -1 неверный запрос, -2 SDK не загрузился, -3 остановлен до начала.
  *   --selftest — Init + проверка голосовых компонентов, JSON-строка с версией SDK, выход (без терминала).
+ *   --serve — постоянный режим интеграции (0.3.8, см. serve.h); однократный выше — как был (test_client.py).
  *   Журнал — коротко в stderr. --sdk-log DIR — подробный журнал самого SDK в каталог (для разбора).
  */
 #define _GNU_SOURCE
@@ -446,18 +447,21 @@ out:
     return rc;
 }
 
+#include "serve.h" /* постоянный режим --serve: пользуется всем, что выше */
+
 int main(int argc, char **argv)
 {
-    int selftest = 0;
+    int selftest = 0, serve = 0;
     const char *dir_opt = NULL, *log_dir = NULL;
     char dir[PATH_MAX];
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--selftest")) selftest = 1;
+        else if (!strcmp(argv[i], "--serve")) serve = 1;
         else if (!strcmp(argv[i], "--sdk-dir") && i + 1 < argc) dir_opt = argv[++i];
         else if (!strcmp(argv[i], "--sdk-log") && i + 1 < argc) log_dir = argv[++i];
         else {
-            fprintf(stderr, "использование: bms_talk [--selftest] [--sdk-dir DIR] [--sdk-log DIR]\n");
+            fprintf(stderr, "использование: bms_talk [--selftest | --serve] [--sdk-dir DIR] [--sdk-log DIR]\n");
             return 2;
         }
     }
@@ -492,5 +496,5 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    return selftest ? run_selftest(dir, log_dir) : run_talk(dir, log_dir);
+    return selftest ? run_selftest(dir, log_dir) : serve ? run_serve(dir, log_dir) : run_talk(dir, log_dir);
 }

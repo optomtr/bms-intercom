@@ -227,7 +227,8 @@ class BMSIntercomDevice(CallTestMixin, CallSourceMixin, TalkRouteMixin):
 
     async def async_shutdown(self) -> None:
         """Stop the listener/poller and close the ISAPI client."""
-        await self.async_talk_stop()
+        # Голос и постоянный помощник SDK (он держит вход на терминал всё время работы).
+        await self.async_talk_shutdown()
         if self._unsub_poll is not None:
             self._unsub_poll()
             self._unsub_poll = None

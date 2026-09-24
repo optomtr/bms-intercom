@@ -327,6 +327,9 @@ class CallSourceMixin:
             self._cancel_call_timeout()
         else:
             self._arm_call_timeout()
+        if new_state == STATE_RINGING:
+            # Помощник голоса SDK к «Ответить» должен быть со входом (talkroute).
+            self._talk_on_ringing()
         self._notify()
 
     @callback

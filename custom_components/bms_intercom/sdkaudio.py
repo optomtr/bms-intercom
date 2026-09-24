@@ -1,4 +1,4 @@
-"""Голос оператора → терминал через HCNetSDK: помощник `bms_talk` подпроцессом.
+"""Голос оператора → терминал через HCNetSDK: помощник `bms_talk` и его проверка.
 
 Зачем: DS-K1T341AM не принимает звук по ISAPI (404 notSupport), а по HCNetSDK
 (порт 8000) принимает — проверено на живом терминале. HCNetSDK — это glibc-
@@ -6,15 +6,15 @@
 в интеграции вместе со своими .so и glibc-загрузчиком (`sdk/<arch>/`) и
 запускается ТОЛЬКО через загрузчик — напрямую musl его не исполнит.
 
-Протокол (stdin/stdout помощника):
-- stdin, первая строка: JSON {host, port, user, password, channel}. Пароль —
-  только так: argv и окружение видны в `ps` любому процессу хоста;
-- stdout, одна строка: {"type":"started","codec":…} или
-  {"type":"error","code":N,"message":…} (после error помощник выходит);
-- дальше в stdin — сырой G.711 µ-law 8 кГц любыми кусками (нарезает помощник);
-  закрытый stdin = «положить трубку», помощник выходит сам;
-- stderr — его журнал, перекладываем в наш DEBUG построчно;
-- `--selftest` → {"type":"selftest","sdk":"…"}: помощник вообще запускается.
+Здесь — общее: где помощник, `--selftest` (запускается ли он вообще на этой
+платформе), коды ошибок SDK словами. Сам разговор с 0.3.8 идёт через
+постоянный помощник `--serve` (sdkhelper.py): вход на терминал один раз при
+загрузке интеграции, а не на каждый «Ответить».
+
+- `--selftest` → {"type":"selftest","sdk":"…"}: помощник вообще запускается;
+- пароль помощнику — только первой строкой stdin: argv и окружение видны в
+  `ps` любому процессу хоста;
+- stderr помощника — его журнал, перекладываем в наш DEBUG построчно.
 """
 from __future__ import annotations
 
@@ -33,10 +33,6 @@ SDK_CHANNEL = 1
 _LOADERS = {"aarch64": "ld-linux-aarch64.so.1", "amd64": "ld-linux-x86-64.so.2"}
 
 SELFTEST_TIMEOUT = 10
-#: Вход в SDK + открытие голоса: терминал под нагрузкой отвечает не мгновенно.
-START_TIMEOUT = 15
-#: Сколько ждём, что помощник выйдет сам после закрытия stdin, до terminate/kill.
-STOP_TIMEOUT = 3
 #: Неудачный selftest повторяем не чаще — иначе каждый talk_start ждал бы 10 с.
 RETRY_FAILED_AFTER = 300
 
@@ -47,15 +43,15 @@ _SDK_ERRORS = {
     1: "неверный логин или пароль терминала",
     7: "терминал не отвечает на порту SDK",
     10: "терминал не ответил вовремя",
-    # 11/31 — ответ StartVoiceCom сразу после входа, пока терминал в своём
-    # режиме вызова (живой DS-K1T341AM, 0.3.6): голос занят его звонком.
+    # 11/31 — ответ StartVoiceCom, пока терминал в своём режиме вызова
+    # (живой DS-K1T341AM, 0.3.6): голос занят его звонком.
     11: "терминал не открыл голос — занят своим вызовом",
     31: "терминал занят",
     153: "учётная запись терминала заблокирована после неверных паролей",
 }
 
 
-#: Коды «терминал занят своим вызовом»: их лечит reject/hangUp + повтор (talkroute).
+#: Коды «терминал занят своим вызовом»: их лечит reject/hangUp + повтор S (talkroute).
 BUSY_CODES = (11, 31)
 
 
@@ -181,119 +177,3 @@ async def _async_kill(proc: asyncio.subprocess.Process) -> None:
             return
         except TimeoutError:
             continue
-
-
-class SDKTalkSession:
-    """Один разговор = один процесс помощника; интерфейс как у ISAPI-сессии."""
-
-    def __init__(self) -> None:
-        self.codec = "G.711ulaw"
-        self._proc: asyncio.subprocess.Process | None = None
-        self._pumps: list[asyncio.Task] = []
-        self._secret = ""
-        self._lock = asyncio.Lock()
-
-    @property
-    def alive(self) -> bool:
-        """Помощник запущен и не вышел: второй talk_start может ехать на нём."""
-        return self._proc is not None and self._proc.returncode is None
-
-    async def async_open(self, host: str, port: int, user: str, password: str) -> str:
-        """Запустить помощника, войти на терминал; вернуть кодек или SDKAudioError."""
-        helper = await _async_helper()
-        if isinstance(helper, str):
-            raise SDKAudioError(helper)
-        cmd, cwd = helper
-        self._secret = password
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, cwd=cwd, stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-        except OSError as err:
-            raise SDKAudioError(f"помощник голоса не запустился: {err}") from err
-        self._proc = proc
-        self._pumps.append(asyncio.create_task(self._pump_stderr(proc)))
-        start = {"host": host, "port": port, "user": user,
-                 "password": password, "channel": SDK_CHANNEL}
-        try:
-            proc.stdin.write(json.dumps(start).encode() + b"\n")
-            await proc.stdin.drain()
-            line = await asyncio.wait_for(proc.stdout.readline(), START_TIMEOUT)
-        except TimeoutError:
-            await self.async_close()
-            raise SDKAudioError("голос по SDK: терминал не ответил за %d с" % START_TIMEOUT) from None
-        except (BrokenPipeError, ConnectionResetError) as err:
-            await self.async_close()
-            raise SDKAudioError("помощник голоса завершился при запуске") from err
-        except asyncio.CancelledError:
-            # talk_stop во время входа (оператор нажал «Сбросить»): помощник
-            # не должен остаться с открытым голосом к терминалу.
-            await self.async_close()
-            raise
-        reply = _parse_line(line)
-        if reply.get("type") == "started":
-            self.codec = str(reply.get("codec") or self.codec)
-            self._pumps.append(asyncio.create_task(self._pump_stdout(proc)))
-            return self.codec
-        await self.async_close()
-        if reply.get("type") == "error":
-            code = reply.get("code")
-            raise SDKAudioError(describe_error(code, reply.get("message")),
-                                code if isinstance(code, int) else None)
-        raise SDKAudioError(
-            f"помощник голоса завершился без ответа (код выхода {proc.returncode})"
-        )
-
-    def _clean(self, text: str) -> str:
-        # Помощник чужой: если он напишет пароль в свой журнал, в журнал HA
-        # пароль всё равно не попадёт.
-        return text.replace(self._secret, "***") if self._secret else text
-
-    async def _pump_stderr(self, proc: asyncio.subprocess.Process) -> None:
-        async for raw in proc.stderr:
-            _LOGGER.debug("[bms_talk] %s", self._clean(raw.decode(errors="replace").rstrip()))
-
-    async def _pump_stdout(self, proc: asyncio.subprocess.Process) -> None:
-        # После started помощник молчит; читаем всё равно, чтобы полная труба
-        # не остановила его, а поздний error попал в журнал.
-        async for raw in proc.stdout:
-            reply = _parse_line(raw)
-            if reply.get("type") == "error":
-                _LOGGER.warning("%s", describe_error(reply.get("code"), reply.get("message")))
-            else:
-                _LOGGER.debug("[bms_talk] %s", self._clean(raw.decode(errors="replace").rstrip()))
-
-    async def async_send(self, data: bytes) -> None:
-        """Отдать кусок G.711 µ-law помощнику."""
-        proc = self._proc
-        if proc is None:
-            return
-        if proc.returncode is not None:
-            raise SDKAudioError(f"помощник голоса завершился (код выхода {proc.returncode})")
-        async with self._lock:
-            try:
-                proc.stdin.write(data)
-                await asyncio.wait_for(proc.stdin.drain(), 5)
-            except (BrokenPipeError, ConnectionResetError, TimeoutError) as err:
-                raise SDKAudioError(f"помощник голоса не принимает звук: {err!r}") from err
-
-    async def async_close(self) -> None:
-        """Закрыть stdin (помощник кладёт трубку и выходит), зависшего — снять."""
-        proc, self._proc = self._proc, None
-        if proc is not None:
-            try:
-                proc.stdin.close()
-            except (BrokenPipeError, ConnectionResetError, RuntimeError):
-                pass
-            try:
-                await asyncio.wait_for(proc.wait(), STOP_TIMEOUT)
-            except TimeoutError:
-                await _async_kill(proc)
-        pumps, self._pumps = self._pumps, []
-        if pumps:
-            # Процесс вышел — трубы закрыты; даём дочитать последние строки журнала.
-            await asyncio.wait(pumps, timeout=1)
-        for task in pumps:
-            task.cancel()
-        await asyncio.gather(*pumps, return_exceptions=True)
