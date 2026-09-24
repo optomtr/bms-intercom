@@ -6,7 +6,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import Entity
 
 from .cardversion import card_version
-from .const import DOMAIN, SIGNAL_STATE_UPDATED
+from .const import DOMAIN, RINGTONE_URL, SIGNAL_STATE_UPDATED
 from .device import BMSIntercomDevice
 
 
@@ -61,6 +61,8 @@ class BMSIntercomEntity(Entity):
         # голоса (isapi/sdk/none), talk_hint — почему голоса нет (talkroute).
         attrs.update(self.device.talk_attributes)
         attrs["snapshot_supported"] = _yes_no(self.device.snapshot_supported)
+        # Путь к мелодии вызова: по нему играет поп-ап и скачивает её планшет.
+        attrs["intercom_ringtone"] = RINGTONE_URL
         # Хэш из ?v= URL карточки: вкладка со старым JS увидит чужой и
         # перезагрузится в простое (иначе два разных поп-апа на одном объекте).
         version = card_version()

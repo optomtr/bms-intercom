@@ -225,6 +225,14 @@ class TestCardVersionAttribute(DeviceTestCase):
             got = self.attrs(device)
         self.assertEqual(got["intercom_card_version"], url_version)
 
+    def test_ringtone_attribute_points_to_a_bundled_file(self):
+        # Планшет качает мелодию по intercom_ringtone: путь должен вести на
+        # реальный файл в frontend/, иначе он молча доиграет прошлую мелодию.
+        device, _hass, _entry = self.make_device()
+        path = self.attrs(device)["intercom_ringtone"]
+        self.assertTrue(path.startswith("/bms_intercom_static/"), path)
+        self.assertTrue((SRC / "frontend" / path.rsplit("/", 1)[1]).is_file(), path)
+
 
 if __name__ == "__main__":
     unittest.main()

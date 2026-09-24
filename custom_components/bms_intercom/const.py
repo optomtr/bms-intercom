@@ -5,6 +5,10 @@ from homeassistant.const import Platform
 
 DOMAIN = "bms_intercom"
 
+# Мелодия вызова — одна точка правды: поп-ап и планшет BMS Tablet берут путь
+# из атрибута intercom_ringtone. Сменится файл — планшет скачает новый сам.
+RINGTONE_URL = f"/{DOMAIN}_static/ring_bms_velvet.mp3"
+
 # Custom config keys (host/username/password/name use Home Assistant's own keys)
 CONF_MODE = "mode"
 CONF_RTSP_PORT = "rtsp_port"

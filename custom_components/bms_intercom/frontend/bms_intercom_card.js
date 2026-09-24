@@ -116,6 +116,7 @@
       if (a.talk_supported) g.talkSupported = a.talk_supported;
       if (a.talk_hint) g.talkHint = a.talk_hint;
       if (a.intercom_card_version) g.cardVersion = a.intercom_card_version;
+      if (a.intercom_ringtone) g.ringtone = a.intercom_ringtone;
       if (a.intercom_role === "call") {
         g.callState = a.call_state || (st.state === "on" ? "ringing" : "idle");
       }
@@ -757,7 +758,7 @@
     if (st) showVideo(hass, cam, st, mode);
 
     overlay.classList.add("show");
-    if (mode === "ringing") playRing(); else stopRing();
+    if (mode === "ringing") playRing(group); else stopRing();
     updateClock();
     activeId = id;
   }
@@ -765,9 +766,12 @@
   // Рингтон звучит только во время звонка. Источник ставится прямо перед
   // воспроизведением и снимается после — чтобы киоск-браузер не мог проиграть
   // его сам при загрузке/включении экрана.
-  function playRing() {
+  function playRing(group) {
     if (!audio) return;
-    if (!audio.getAttribute("src")) audio.src = assetUrl(`${STATIC}/ring_bms_velvet.mp3`);
+    // Путь из атрибута intercom_ringtone (тот же берёт планшет); без него —
+    // встроенная мелодия. Полный URL не склеиваем с адресом HA.
+    const path = (group && group.ringtone) || `${STATIC}/ring_bms_velvet.mp3`;
+    if (!audio.getAttribute("src")) audio.src = /^https?:\/\//.test(path) ? path : assetUrl(path);
     audio.currentTime = 0;
     audio.play().catch(() => {});
   }
